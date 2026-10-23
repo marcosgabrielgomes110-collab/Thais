@@ -1,0 +1,37 @@
+[advisories]
+version = 2
+yanked = "warn"
+ignore = [
+  { id = "RUSTSEC-2026-0370", reason = "zvariant is pulled in by keyring 4.2's Secret Service backend; no safe upgrade is available yet." },
+  { id = "RUSTSEC-2026-0371", reason = "zbus_names is pulled in by keyring 4.2's Secret Service backend; no safe upgrade is available yet." },
+  { id = "RUSTSEC-2026-0372", reason = "zvariant_derive is pulled in by keyring 4.2's Secret Service backend; no safe upgrade is available yet." },
+]
+
+[licenses]
+version = 2
+confidence-threshold = 0.8
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Unicode-3.0",
+  "Zlib",
+  "MPL-2.0",
+  "CC0-1.0",
+  "BSL-1.0",
+]
+
+[licenses.private]
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

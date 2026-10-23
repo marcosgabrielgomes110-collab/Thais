@@ -1,0 +1,24 @@
+[package]
+name = "thais-e2e"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+thais-core = { version = "0.1.0", path = "../../crates/thais-core" }
+thais-protocol = { version = "0.1.0", path = "../../crates/thais-protocol" }
+thais-providers = { version = "0.1.0", path = "../../crates/thais-providers" }
+thais-sdk = { version = "0.1.0", path = "../../crates/thais-sdk" }
+thais-storage = { version = "0.1.0", path = "../../crates/thais-storage" }
+serde_json.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+assert_cmd.workspace = true
+insta.workspace = true
+predicates.workspace = true
+
+[lints]
+workspace = true

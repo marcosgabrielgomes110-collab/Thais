@@ -1,0 +1,242 @@
+#![forbid(unsafe_code)]
+
+//! Client SDK for the Thais Agent API. Clients depend on this crate and
+//! `thais-protocol`; they never import `thais-core`.
+
+use std::sync::atomic::{AtomicI64, Ordering};
+
+use async_trait::async_trait;
+use futures_util::stream::BoxStream;
+use serde_json::Value;
+use thais_protocol::error::ProtocolError;
+use thais_protocol::jsonrpc::{Notification, Request, Response};
+use thais_protocol::method;
+use thais_protocol::session::{
+    InitializeParams, InitializeResult, SessionApproveParams, SessionApproveResult,
+    SessionCancelParams, SessionCancelResult, SessionCreateParams, SessionCreateResult,
+    SessionSendParams, SessionSendResult, SessionSubscribeParams, SessionSubscribeResult,
+};
+use thiserror::Error;
+
+pub use thais_protocol as protocol;
+
+/// A bidirectional Agent API transport.
+#[async_trait]
+pub trait Transport: Send + Sync {
+    /// Send one request and await its response.
+    async fn send(&self, request: Request) -> Result<Response, SdkError>;
+
+    /// Stream of server notifications.
+    fn notifications(&self) -> BoxStream<'static, Notification>;
+}
+
+/// SDK failures.
+#[derive(Debug, Error)]
+pub enum SdkError {
+    /// Transport-level failure.
+    #[error("transport error: {0}")]
+    Transport(String),
+    /// Protocol validation or parsing failure.
+    #[error("protocol error: {0}")]
+    Protocol(#[from] ProtocolError),
+    /// JSON serialization failure.
+    #[error("JSON error: {0}")]
+    Json(#[from] serde_json::Error),
+    /// Error returned by the server.
+    #[error("remote error {code}: {message}")]
+    Remote {
+        /// JSON-RPC error code.
+        code: i64,
+        /// Error message.
+        message: String,
+    },
+}
+
+/// Typed client over any [`Transport`].
+pub struct Client<T> {
+    transport: T,
+    next_id: AtomicI64,
+}
+
+impl<T: Transport> Client<T> {
+    /// Build a client.
+    #[must_use]
+    pub fn new(transport: T) -> Self {
+        Self {
+            transport,
+            next_id: AtomicI64::new(1),
+        }
+    }
+
+    /// Server notifications.
+    pub fn notifications(&self) -> BoxStream<'static, Notification> {
+        self.transport.notifications()
+    }
+
+    /// Send a raw request and return the result value.
+    pub async fn request(&self, method: &str, params: Value) -> Result<Value, SdkError> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let request = Request::new(id, method, params);
+        let response = self.transport.send(request).await?;
+
+        if let Some(error) = response.error {
+            return Err(SdkError::Remote {
+                code: error.code,
+                message: error.message,
+            });
+        }
+        response.result.ok_or_else(|| {
+            SdkError::Protocol(ProtocolError::InvalidRequest(
+                "response has neither result nor error".to_owned(),
+            ))
+        })
+    }
+
+    /// Perform the protocol handshake.
+    pub async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult, SdkError> {
+        let value = self
+            .request(method::INITIALIZE, serde_json::to_value(params)?)
+            .await?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    /// Create a session.
+    pub async fn session_create(
+        &self,
+        params: SessionCreateParams,
+    ) -> Result<SessionCreateResult, SdkError> {
+        let value = self
+            .request(method::SESSION_CREATE, serde_json::to_value(params)?)
+            .await?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    /// Send input to a session.
+    pub async fn session_send(
+        &self,
+        params: SessionSendParams,
+    ) -> Result<SessionSendResult, SdkError> {
+        let value = self
+            .request(method::SESSION_SEND, serde_json::to_value(params)?)
+            .await?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    /// Cancel a session turn.
+    pub async fn session_cancel(
+        &self,
+        params: SessionCancelParams,
+    ) -> Result<SessionCancelResult, SdkError> {
+        let value = self
+            .request(method::SESSION_CANCEL, serde_json::to_value(params)?)
+            .await?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    /// Approve or deny a pending action.
+    pub async fn session_approve(
+        &self,
+        params: SessionApproveParams,
+    ) -> Result<SessionApproveResult, SdkError> {
+        let value = self
+            .request(method::SESSION_APPROVE, serde_json::to_value(params)?)
+            .await?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    /// Subscribe to a session's event stream.
+    pub async fn session_subscribe(
+        &self,
+        params: SessionSubscribeParams,
+    ) -> Result<SessionSubscribeResult, SdkError> {
+        let value = self
+            .request(method::SESSION_SUBSCRIBE, serde_json::to_value(params)?)
+            .await?;
+        Ok(serde_json::from_value(value)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::StreamExt;
+    use futures_util::stream;
+    use std::sync::Mutex;
+    use thais_protocol::jsonrpc::Id;
+    use thais_protocol::session::SessionMode;
+
+    struct FakeTransport {
+        responses: Mutex<Vec<Response>>,
+        requests: Mutex<Vec<Request>>,
+    }
+
+    impl FakeTransport {
+        fn new(responses: Vec<Response>) -> Self {
+            Self {
+                responses: Mutex::new(responses),
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Transport for FakeTransport {
+        async fn send(&self, request: Request) -> Result<Response, SdkError> {
+            self.requests.lock().expect("requests").push(request);
+            Ok(self.responses.lock().expect("responses").remove(0))
+        }
+
+        fn notifications(&self) -> BoxStream<'static, Notification> {
+            stream::empty().boxed()
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_calls_build_requests_and_parse_results() {
+        let response = Response::success(
+            Id::Number(1),
+            serde_json::to_value(InitializeResult {
+                server_name: "thais".to_owned(),
+                server_version: "0.1.0".to_owned(),
+                protocol_version: "1.0".to_owned(),
+                capabilities: serde_json::json!({}),
+            })
+            .expect("result"),
+        );
+        let transport = FakeTransport::new(vec![response]);
+        let client = Client::new(transport);
+
+        let result = client
+            .initialize(InitializeParams {
+                client_name: "test".to_owned(),
+                client_version: "0.1".to_owned(),
+                protocol_version: "1.0".to_owned(),
+                capabilities: serde_json::json!({}),
+            })
+            .await
+            .expect("initialize");
+        assert_eq!(result.server_name, "thais");
+
+        let requests = client.transport.requests.lock().expect("requests");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, method::INITIALIZE);
+    }
+
+    #[tokio::test]
+    async fn remote_errors_are_preserved() {
+        let transport = FakeTransport::new(vec![Response::error(
+            Id::Number(1),
+            thais_protocol::error::ErrorObject::new(-32602, "bad params"),
+        )]);
+        let client = Client::new(transport);
+        let error = client
+            .session_create(SessionCreateParams {
+                workspace: "/tmp".to_owned(),
+                mode: SessionMode::Build,
+                model: None,
+            })
+            .await
+            .expect_err("error");
+        assert!(matches!(error, SdkError::Remote { code: -32602, .. }));
+    }
+}
