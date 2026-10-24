@@ -271,7 +271,17 @@ fn sessions_and_models_commands_report_persisted_state() {
     assert!(stdout.contains("fake-model"), "{stdout}");
     assert!(stdout.contains("active"), "{stdout}");
 
-    let config = temp.path().join("config").join("thais");
+    let mut command = Command::new(binary());
+    with_xdg(&mut command, temp.path());
+    let output = command.arg("doctor").output().expect("doctor");
+    assert!(output.status.success());
+    let doctor = String::from_utf8(output.stdout).expect("stdout");
+    let config = doctor
+        .lines()
+        .find_map(|line| line.strip_prefix("config: "))
+        .map(Path::new)
+        .expect("config path")
+        .to_path_buf();
     std::fs::create_dir_all(&config).expect("config");
     std::fs::write(
         config.join("providers.toml"),
