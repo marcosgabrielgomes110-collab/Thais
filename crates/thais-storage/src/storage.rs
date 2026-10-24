@@ -428,7 +428,8 @@ impl Storage {
         let existing = self.lease_holder(canonical_workspace)?;
 
         if let Some(lease) = &existing {
-            let expired = lease.expires_at.as_str() <= now_text.as_str();
+            let expired = chrono::DateTime::parse_from_rfc3339(&lease.expires_at)
+                .map_or(true, |expires| expires <= now);
             if lease.session_id != session_id && !expired && !steal {
                 return Ok(Some(lease.clone()));
             }
