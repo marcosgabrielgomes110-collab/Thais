@@ -54,13 +54,20 @@ impl PermissionGate {
             "grep",
             "git_status",
             "git_diff",
+            "git_log",
+            "git_show",
+            "git_commit",
+            "lsp_diagnostics",
+            "lsp_definition",
+            "lsp_references",
             "write",
             "edit",
             "apply_patch",
             "bash",
             "memory_write",
+            "subagent",
         ];
-        if !KNOWN.contains(&tool) {
+        if !KNOWN.contains(&tool) && !tool.starts_with("mcp__") {
             return PermissionDecision::Deny(format!("tool `{tool}` is not available"));
         }
 

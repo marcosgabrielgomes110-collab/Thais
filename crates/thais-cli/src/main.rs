@@ -553,6 +553,8 @@ fn build_runtime(
         runtime
             .with_snapshot_base(paths.snapshots_dir())
             .with_checkpoint_base(paths.sessions_dir())
+            .with_lsp(thais_core::LspConfig::load(&paths.config_file("lsp.toml"))?)
+            .with_mcp(thais_core::McpConfig::load(&paths.config_file("mcp.toml"))?)
             .with_verifier(Verifier::load(&paths.config_file("verifier.toml"))?),
     ))
 }
@@ -792,6 +794,14 @@ fn print_human(events: &[EventEnvelope]) {
             }
             EventKind::ContextRebuildFailed => {
                 let _ = writeln!(stderr, "context rebuild failed; using checkpoint");
+            }
+            EventKind::LspDiagnostics => {
+                let path = event
+                    .payload
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("file");
+                let _ = writeln!(stderr, "lsp diagnostics: {path}");
             }
             EventKind::MemoryUpdated => {
                 let rule = event

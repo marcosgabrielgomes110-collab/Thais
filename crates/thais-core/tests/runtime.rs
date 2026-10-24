@@ -1400,3 +1400,439 @@ async fn releasing_a_lease_allows_the_next_mutating_session() {
         .await
         .expect("second after release");
 }
+
+#[tokio::test]
+async fn explore_subagent_runs_in_a_child_session_and_returns_a_summary() {
+    let temp = tempfile::tempdir().expect("temp");
+    let runtime = runtime_with_scripts(
+        &temp,
+        vec![
+            script(vec![FakeStep::ToolCall {
+                index: 0,
+                id: "call_subagent".to_owned(),
+                name: "subagent".to_owned(),
+                arguments: json!({
+                    "kind": "explore",
+                    "task": "inspect the repository"
+                })
+                .to_string(),
+            }]),
+            script(vec![FakeStep::Text {
+                text: "child summary: no writes".to_owned(),
+            }]),
+            script(vec![FakeStep::Text {
+                text: "parent received the summary".to_owned(),
+            }]),
+        ],
+    );
+    let session = runtime
+        .create_session(
+            temp.path().to_string_lossy().into_owned(),
+            SessionMode::Build,
+            None,
+        )
+        .await
+        .expect("create");
+    let mut live = runtime.subscribe_live();
+    runtime
+        .send(&session.session_id, "delegate".to_owned(), None)
+        .await
+        .expect("send");
+    let mut tool_result = None;
+    tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            let event = live.recv().await.expect("event");
+            if event.session_id == session.session_id
+                && event.kind == EventKind::ToolResult
+                && event.payload["name"] == "subagent"
+            {
+                tool_result = Some(event.clone());
+            }
+            if event.session_id == session.session_id && event.kind == EventKind::TurnCompleted {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("parent turn");
+    let result = tool_result.expect("subagent result");
+    assert!(
+        result.payload["content"]
+            .as_str()
+            .expect("content")
+            .contains("child summary"),
+        "{result:?}"
+    );
+    let sessions = runtime
+        .list_sessions_with_archived(true)
+        .await
+        .expect("list");
+    assert!(
+        sessions
+            .iter()
+            .any(|child| child.parent_id.as_deref() == Some(&session.session_id)),
+        "child session should carry parent_id"
+    );
+    let events = runtime
+        .replay_session(&session.session_id)
+        .await
+        .expect("replay");
+    assert!(
+        events
+            .events
+            .iter()
+            .any(|event| event.kind == EventKind::ToolResult)
+    );
+}
+
+#[tokio::test]
+async fn general_subagent_rolls_back_when_verification_fails() {
+    let temp = tempfile::tempdir().expect("temp");
+    let storage =
+        thais_storage::StorageHandle::open(temp.path().join("thais.db")).expect("storage");
+    let provider: Arc<dyn thais_providers::Provider> = Arc::new(FakeProvider::with_scripts(
+        "fake",
+        vec![
+            script(vec![FakeStep::ToolCall {
+                index: 0,
+                id: "call_general".to_owned(),
+                name: "subagent".to_owned(),
+                arguments: json!({
+                    "kind": "general",
+                    "task": "create a file"
+                })
+                .to_string(),
+            }]),
+            script(vec![FakeStep::ToolCall {
+                index: 0,
+                id: "call_write".to_owned(),
+                name: "write".to_owned(),
+                arguments: json!({
+                    "path": "generated.txt",
+                    "content": "temporary\n"
+                })
+                .to_string(),
+            }]),
+            script(vec![FakeStep::Text {
+                text: "general failed".to_owned(),
+            }]),
+        ],
+    ));
+    let runtime = Arc::new(
+        Runtime::new(
+            storage,
+            provider,
+            Arc::new(FixedClock::new("2026-10-23T00:00:00Z")),
+            Arc::new(SequenceIdGenerator::new("g")),
+            ContextManager::empty(),
+        )
+        .with_snapshot_base(temp.path().join("snapshots"))
+        .with_checkpoint_base(temp.path().join("sessions"))
+        .with_verifier(thais_core::Verifier::new(
+            vec!["false".to_owned()],
+            Duration::from_secs(5),
+        )),
+    );
+    let session = runtime
+        .create_session(
+            temp.path().to_string_lossy().into_owned(),
+            SessionMode::Build,
+            None,
+        )
+        .await
+        .expect("create");
+    let mut live = runtime.subscribe_live();
+    runtime
+        .send(&session.session_id, "delegate a build".to_owned(), None)
+        .await
+        .expect("send");
+    let mut approved = 0;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let event = live.recv().await.expect("event");
+            if event.kind == EventKind::PermissionRequested {
+                approved += 1;
+                runtime
+                    .approve(
+                        &event.session_id,
+                        event.payload["approval_id"].as_str().expect("approval id"),
+                        ApprovalDecision::Allow,
+                    )
+                    .await
+                    .expect("approve");
+            }
+            if event.session_id == session.session_id && event.kind == EventKind::TurnCompleted {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("parent turn");
+    assert_eq!(approved, 2);
+    assert!(!temp.path().join("generated.txt").exists());
+}
+
+#[tokio::test]
+async fn mcp_tool_calls_are_gated_and_audited() {
+    if std::process::Command::new("python3")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_err()
+    {
+        return;
+    }
+    let temp = tempfile::tempdir().expect("temp");
+    let server_script = temp.path().join("fake_mcp.py");
+    std::fs::write(
+        &server_script,
+        r#"
+import json, sys
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    ident = message.get("id")
+    if method == "initialize":
+        print(json.dumps({"jsonrpc":"2.0","id":ident,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"fake","version":"1"}}}), flush=True)
+    elif method == "tools/list":
+        print(json.dumps({"jsonrpc":"2.0","id":ident,"result":{"tools":[{"name":"echo","description":"Echo","inputSchema":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}}]}}), flush=True)
+    elif method == "tools/call":
+        print(json.dumps({"jsonrpc":"2.0","id":ident,"result":{"content":[{"type":"text","text":"echo: " + message["params"]["arguments"]["text"]}],"isError":False}}), flush=True)
+"#,
+    )
+    .expect("script");
+    let storage =
+        thais_storage::StorageHandle::open(temp.path().join("thais.db")).expect("storage");
+    let provider: Arc<dyn thais_providers::Provider> = Arc::new(FakeProvider::with_scripts(
+        "fake",
+        vec![
+            script(vec![FakeStep::ToolCall {
+                index: 0,
+                id: "call_mcp".to_owned(),
+                name: "mcp__fake__echo".to_owned(),
+                arguments: json!({"text": "hello"}).to_string(),
+            }]),
+            script(vec![FakeStep::Text {
+                text: "mcp complete".to_owned(),
+            }]),
+        ],
+    ));
+    let config = thais_tools::McpConfig {
+        servers: vec![thais_tools::McpServerConfig {
+            id: "fake".to_owned(),
+            command: "python3".to_owned(),
+            url: None,
+            args: vec![server_script.to_string_lossy().into_owned()],
+            timeout_ms: 2_000,
+            read_only: false,
+            transport: "stdio".to_owned(),
+        }],
+    };
+    let runtime = Arc::new(
+        Runtime::new(
+            storage,
+            provider,
+            Arc::new(FixedClock::new("2026-10-23T00:00:00Z")),
+            Arc::new(SequenceIdGenerator::new("m")),
+            ContextManager::empty(),
+        )
+        .with_snapshot_base(temp.path().join("snapshots"))
+        .with_checkpoint_base(temp.path().join("sessions"))
+        .with_mcp(config),
+    );
+    let session = runtime
+        .create_session(
+            temp.path().to_string_lossy().into_owned(),
+            SessionMode::Build,
+            None,
+        )
+        .await
+        .expect("create");
+    let mut live = runtime.subscribe_live();
+    runtime
+        .send(&session.session_id, "use mcp".to_owned(), None)
+        .await
+        .expect("send");
+    let mut approval_id = None;
+    let mut result = None;
+    tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            let event = live.recv().await.expect("event");
+            if event.kind == EventKind::PermissionRequested {
+                approval_id = event.payload["approval_id"].as_str().map(ToOwned::to_owned);
+                runtime
+                    .approve(
+                        &session.session_id,
+                        approval_id.as_deref().expect("id"),
+                        ApprovalDecision::Allow,
+                    )
+                    .await
+                    .expect("approve");
+            }
+            if event.session_id == session.session_id
+                && event.kind == EventKind::ToolResult
+                && event.payload["name"] == "mcp__fake__echo"
+            {
+                result = Some(event.clone());
+            }
+            if event.session_id == session.session_id && event.kind == EventKind::TurnCompleted {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("turn");
+    assert!(approval_id.is_some());
+    assert!(
+        result.expect("mcp result").payload["content"]
+            .as_str()
+            .expect("content")
+            .contains("echo: hello")
+    );
+    let replay = runtime
+        .replay_session(&session.session_id)
+        .await
+        .expect("replay");
+    assert!(
+        replay
+            .events
+            .iter()
+            .any(|event| event.kind == EventKind::PermissionRequested)
+    );
+}
+
+#[tokio::test]
+async fn lsp_diagnostics_feed_the_verifier_and_roll_back_edits() {
+    if std::process::Command::new("python3")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_err()
+    {
+        return;
+    }
+    let temp = tempfile::tempdir().expect("temp");
+    let lsp_script = temp.path().join("fake_lsp.py");
+    std::fs::write(
+        &lsp_script,
+        r#"
+import json, sys
+def read():
+    headers = {}
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return None
+        if line in (b"\r\n", b"\n"):
+            break
+        key, value = line.decode().split(":", 1)
+        headers[key.lower()] = value.strip()
+    return json.loads(sys.stdin.buffer.read(int(headers["content-length"])))
+def write(value):
+    body = json.dumps(value).encode()
+    sys.stdout.buffer.write(("Content-Length: %d\r\n\r\n" % len(body)).encode() + body)
+    sys.stdout.buffer.flush()
+while True:
+    message = read()
+    if message is None:
+        break
+    method = message.get("method")
+    ident = message.get("id")
+    if method == "initialize":
+        write({"jsonrpc":"2.0","id":ident,"result":{"capabilities":{}}})
+    elif method == "textDocument/didOpen":
+        write({"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{"uri":message["params"]["textDocument"]["uri"],"diagnostics":[{"range":{"start":{"line":0,"character":0}},"severity":1,"message":"fake lsp error"}]}})
+"#,
+    )
+    .expect("lsp script");
+    let lsp_config_path = temp.path().join("lsp.toml");
+    std::fs::write(
+        &lsp_config_path,
+        format!(
+            r#"
+[[servers]]
+id = "fake"
+command = "python3"
+args = ["{}"]
+extensions = ["txt"]
+timeout_ms = 2000
+"#,
+            lsp_script.to_string_lossy()
+        ),
+    )
+    .expect("lsp config");
+    let storage =
+        thais_storage::StorageHandle::open(temp.path().join("thais.db")).expect("storage");
+    let provider: Arc<dyn thais_providers::Provider> = Arc::new(FakeProvider::with_scripts(
+        "fake",
+        vec![
+            script(vec![FakeStep::ToolCall {
+                index: 0,
+                id: "call_write".to_owned(),
+                name: "write".to_owned(),
+                arguments: json!({"path": "main.txt", "content": "bad\n"}).to_string(),
+            }]),
+            script(vec![FakeStep::Text {
+                text: "verification failed".to_owned(),
+            }]),
+        ],
+    ));
+    let runtime = Arc::new(
+        Runtime::new(
+            storage,
+            provider,
+            Arc::new(FixedClock::new("2026-10-23T00:00:00Z")),
+            Arc::new(SequenceIdGenerator::new("l")),
+            ContextManager::empty(),
+        )
+        .with_snapshot_base(temp.path().join("snapshots"))
+        .with_checkpoint_base(temp.path().join("sessions"))
+        .with_lsp(thais_core::LspConfig::load(&lsp_config_path).expect("lsp")),
+    );
+    let session = runtime
+        .create_session(
+            temp.path().to_string_lossy().into_owned(),
+            SessionMode::Build,
+            None,
+        )
+        .await
+        .expect("create");
+    let mut live = runtime.subscribe_live();
+    runtime
+        .send(&session.session_id, "write code".to_owned(), None)
+        .await
+        .expect("send");
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let event = live.recv().await.expect("event");
+            if event.kind == EventKind::PermissionRequested {
+                runtime
+                    .approve(
+                        &event.session_id,
+                        event.payload["approval_id"].as_str().expect("approval id"),
+                        ApprovalDecision::Allow,
+                    )
+                    .await
+                    .expect("approve");
+            }
+            if event.session_id == session.session_id && event.kind == EventKind::TurnCompleted {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("turn");
+    assert!(!temp.path().join("main.txt").exists());
+    let replay = runtime
+        .replay_session(&session.session_id)
+        .await
+        .expect("replay");
+    assert!(
+        replay
+            .events
+            .iter()
+            .any(|event| event.kind == EventKind::LspDiagnostics)
+    );
+}

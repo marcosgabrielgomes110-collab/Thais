@@ -1,0 +1,21 @@
+# Copy to ~/.config/thais/mcp.toml.
+# Tools are exposed to the model as mcp__<server>__<tool>.
+# `read_only = true` skips approval for that server's tools.
+# `read_only = false` (default) routes every call through the permission gate.
+
+[[servers]]
+id = "filesystem"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/project"]
+transport = "stdio"
+timeout_ms = 5000
+read_only = false
+
+# Streamable HTTP is also supported.
+# [[servers]]
+# id = "remote"
+# transport = "http"
+# url = "http://127.0.0.1:3000/mcp"
+# command = "unused"
+# timeout_ms = 5000
+# read_only = false

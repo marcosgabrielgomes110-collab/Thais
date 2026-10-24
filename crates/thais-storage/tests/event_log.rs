@@ -12,6 +12,7 @@ fn session(workspace: &Path) -> SessionInfo {
     let now = "2026-10-23T00:00:00Z".to_owned();
     SessionInfo {
         session_id: "s-1".to_owned(),
+        parent_id: None,
         name: "s-1".to_owned(),
         workspace: workspace.to_string_lossy().into_owned(),
         mode: SessionMode::Build,
@@ -207,7 +208,7 @@ fn trust_is_keyed_by_path_and_config_hash() {
 fn schema_version_and_integrity() {
     let temp = tempfile::tempdir().expect("temp");
     let storage = open(&temp);
-    assert_eq!(storage.schema_version().expect("version"), 2);
+    assert_eq!(storage.schema_version().expect("version"), 3);
     assert_eq!(storage.integrity_check().expect("integrity"), "ok");
 }
 

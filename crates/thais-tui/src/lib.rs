@@ -53,6 +53,7 @@ pub async fn run<T: Transport + 'static>(
         .session_create(SessionCreateParams {
             workspace,
             name: None,
+            parent_id: None,
             mode,
             model,
             steal_lease: false,
@@ -361,6 +362,15 @@ impl AppState {
                 self.transcript
                     .push_str("\n[context rebuild failed; using checkpoint]\n");
                 self.status = "rebuild fallback".to_owned();
+            }
+            EventKind::LspDiagnostics => {
+                let path = event
+                    .payload
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("file");
+                self.transcript
+                    .push_str(&format!("\n[lsp] {path}: diagnostics updated\n"));
             }
             EventKind::MemoryUpdated => {
                 let rule = event
@@ -812,6 +822,7 @@ mod tests {
     fn session() -> SessionInfo {
         SessionInfo {
             session_id: "session_1234567890".to_owned(),
+            parent_id: None,
             name: "test".to_owned(),
             workspace: "/tmp".to_owned(),
             mode: SessionMode::Build,

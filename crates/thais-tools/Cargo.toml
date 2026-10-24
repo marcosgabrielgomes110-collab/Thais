@@ -10,11 +10,13 @@ diffy.workspace = true
 globset.workspace = true
 ignore.workspace = true
 regex.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 similar.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
+toml.workspace = true
 wait-timeout.workspace = true
 
 [target.'cfg(unix)'.dependencies]
@@ -22,6 +24,8 @@ nix = { version = "0.31", features = ["signal", "process"] }
 
 [dev-dependencies]
 tempfile.workspace = true
+tokio.workspace = true
+wiremock.workspace = true
 
 [lints]
 workspace = true

@@ -31,7 +31,8 @@ use thais_providers::{
 };
 use thais_storage::{NewEvent, StorageError, StorageHandle};
 use thais_tools::{
-    PermissionDecision, PermissionGate, PolicyMode, ToolError, ToolRegistry, ToolResult,
+    LspConfig, McpConfig, PermissionDecision, PermissionGate, PolicyMode, ToolError, ToolRegistry,
+    ToolResult,
 };
 use thiserror::Error;
 use tokio::sync::{Mutex, broadcast, oneshot};
@@ -55,6 +56,9 @@ const LEASE_TTL_SECS: u64 = 300;
 const DEFAULT_MAX_TURN_COST_USD: f64 = 2.0;
 const DEFAULT_REBUILD_THRESHOLD_TOKENS: usize = 12_000;
 const DEFAULT_HISTORY_TAIL_TURNS: usize = 4;
+const SUBAGENT_MAX_ITERATIONS: usize = 4;
+const SUBAGENT_MAX_TOKENS: u64 = 20_000;
+const SUBAGENT_MAX_TIME: Duration = Duration::from_secs(120);
 
 fn model_info(model: CatalogModel) -> ModelInfo {
     ModelInfo {
@@ -189,6 +193,8 @@ pub struct Runtime {
     snapshot_base: Option<PathBuf>,
     checkpoint_base: Option<PathBuf>,
     max_turn_cost_usd: f64,
+    lsp_config: Option<Arc<LspConfig>>,
+    mcp_config: Option<Arc<McpConfig>>,
     rebuild_threshold_tokens: usize,
     history_tail_turns: usize,
     verifier: Option<Arc<Verifier>>,
@@ -217,6 +223,8 @@ impl Runtime {
             snapshot_base: None,
             checkpoint_base: None,
             max_turn_cost_usd: DEFAULT_MAX_TURN_COST_USD,
+            lsp_config: None,
+            mcp_config: None,
             rebuild_threshold_tokens: DEFAULT_REBUILD_THRESHOLD_TOKENS,
             history_tail_turns: DEFAULT_HISTORY_TAIL_TURNS,
             verifier: None,
@@ -245,6 +253,8 @@ impl Runtime {
             snapshot_base: None,
             checkpoint_base: None,
             max_turn_cost_usd: DEFAULT_MAX_TURN_COST_USD,
+            lsp_config: None,
+            mcp_config: None,
             rebuild_threshold_tokens: DEFAULT_REBUILD_THRESHOLD_TOKENS,
             history_tail_turns: DEFAULT_HISTORY_TAIL_TURNS,
             verifier: None,
@@ -279,6 +289,20 @@ impl Runtime {
     #[must_use]
     pub fn with_cost_limit(mut self, limit: f64) -> Self {
         self.max_turn_cost_usd = limit.max(0.0);
+        self
+    }
+
+    /// Attach an LSP configuration to session tool registries.
+    #[must_use]
+    pub fn with_lsp(mut self, config: LspConfig) -> Self {
+        self.lsp_config = Some(Arc::new(config));
+        self
+    }
+
+    /// Attach a stdio MCP configuration to session tool registries.
+    #[must_use]
+    pub fn with_mcp(mut self, config: McpConfig) -> Self {
+        self.mcp_config = Some(Arc::new(config));
         self
     }
 
@@ -321,6 +345,20 @@ impl Runtime {
         model: Option<String>,
         name: Option<String>,
         steal_lease: bool,
+    ) -> Result<SessionInfo, RuntimeError> {
+        self.create_session_with_parent(workspace, mode, model, name, steal_lease, None)
+            .await
+    }
+
+    /// Create a session with an optional parent id.
+    pub async fn create_session_with_parent(
+        &self,
+        workspace: impl Into<String>,
+        mode: SessionMode,
+        model: Option<String>,
+        name: Option<String>,
+        steal_lease: bool,
+        parent_id: Option<String>,
     ) -> Result<SessionInfo, RuntimeError> {
         let workspace = workspace.into();
         let canonical = thais_storage::canonical_workspace(Path::new(&workspace))
@@ -366,6 +404,7 @@ impl Runtime {
 
         let info = SessionInfo {
             session_id: session_id.clone(),
+            parent_id,
             name,
             workspace: canonical,
             mode,
@@ -420,6 +459,16 @@ impl Runtime {
         let tools = match info.mode {
             SessionMode::Plan => ToolRegistry::read_only(Path::new(&info.workspace))?,
             SessionMode::Build => ToolRegistry::read_write(Path::new(&info.workspace))?,
+        };
+        let tools = if let Some(config) = &self.lsp_config {
+            tools.with_lsp((**config).clone())
+        } else {
+            tools
+        };
+        let tools = if let Some(config) = &self.mcp_config {
+            tools.with_mcp((**config).clone())
+        } else {
+            tools
         };
         let gate = PermissionGate::new(match info.mode {
             SessionMode::Plan => PolicyMode::Plan,
@@ -1088,12 +1137,13 @@ impl Runtime {
                     }
                 };
                 match self
-                    .create_session_with(
+                    .create_session_with_parent(
                         params.workspace,
                         params.mode,
                         params.model,
                         params.name,
                         params.steal_lease,
+                        params.parent_id,
                     )
                     .await
                 {
@@ -1399,6 +1449,444 @@ impl Runtime {
         {
             state.turn = None;
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_subagent(
+        &self,
+        parent: &SessionInfo,
+        kind: &str,
+        task: &str,
+        cancel: &CancellationToken,
+        parent_turn_id: &str,
+    ) -> Result<ToolResult, ToolError> {
+        if task.trim().is_empty() {
+            return Err(ToolError::InvalidArgs("subagent task is empty".to_owned()));
+        }
+        if !matches!(kind, "explore" | "general") {
+            return Err(ToolError::InvalidArgs(format!(
+                "unknown subagent kind: {kind}"
+            )));
+        }
+        if parent.mode == SessionMode::Plan && kind == "general" {
+            return Err(ToolError::Denied(
+                "general subagents require build mode".to_owned(),
+            ));
+        }
+        if kind == "general" {
+            let decision = self
+                .request_approval(
+                    &parent.session_id,
+                    json!({
+                        "type": "subagent",
+                        "kind": kind,
+                        "task": task,
+                        "parent_turn_id": parent_turn_id
+                    }),
+                )
+                .await
+                .map_err(|error| ToolError::Command(error.to_string()))?;
+            if decision != ApprovalDecision::Allow {
+                return Err(ToolError::Denied("subagent denied by user".to_owned()));
+            }
+        }
+
+        let mode = if kind == "explore" {
+            SessionMode::Plan
+        } else {
+            SessionMode::Build
+        };
+        let child_id = self.ids.new_id("session");
+        let now = self.clock.now_rfc3339();
+        let child = SessionInfo {
+            session_id: child_id.clone(),
+            parent_id: Some(parent.session_id.clone()),
+            name: format!("{kind}: {}", truncate_text(task, 60)),
+            workspace: parent.workspace.clone(),
+            mode,
+            model: parent.model.clone(),
+            model_policy: parent.model_policy.clone(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cost_usd: 0.0,
+            status: SessionStatus::Active,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        self.storage
+            .create_session(child.clone())
+            .await
+            .map_err(|error| ToolError::Command(error.to_string()))?;
+        write_checkpoint(
+            &self.checkpoint_path(&child_id),
+            &CheckpointState {
+                session_id: child_id.clone(),
+                name: child.name.clone(),
+                workspace: child.workspace.clone(),
+                mode,
+                model_policy: child.model_policy.clone(),
+                state: "subagent".to_owned(),
+                plan: None,
+                tasks: vec![task.to_owned()],
+                summary: None,
+                last_compacted_seq: 0,
+                updated_at: self.clock.now_rfc3339(),
+            },
+        )
+        .map_err(|error| ToolError::Command(error.to_string()))?;
+        self.append_event(
+            &child_id,
+            EventKind::SessionCreated,
+            json!({"session": &child, "parent_turn_id": parent_turn_id}),
+        )
+        .await
+        .map_err(|error| ToolError::Command(error.to_string()))?;
+
+        let tools = match mode {
+            SessionMode::Plan => ToolRegistry::read_only(Path::new(&child.workspace)),
+            SessionMode::Build => ToolRegistry::read_write(Path::new(&child.workspace)),
+        }
+        .map_err(|error| ToolError::Command(error.to_string()))?
+        .without_tool("subagent");
+        let tools = if let Some(config) = &self.lsp_config {
+            tools.with_lsp((**config).clone())
+        } else {
+            tools
+        };
+        let tools = if let Some(config) = &self.mcp_config {
+            tools.with_mcp((**config).clone())
+        } else {
+            tools
+        };
+        let tools = Arc::new(tools);
+        let gate = PermissionGate::new(match mode {
+            SessionMode::Plan => PolicyMode::Plan,
+            SessionMode::Build => PolicyMode::Build,
+        });
+        let snapshot_root = self.snapshot_base.clone().unwrap_or_else(|| {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            child.workspace.hash(&mut hasher);
+            std::env::temp_dir().join(format!("thais-snapshots-{:016x}", hasher.finish()))
+        });
+        let snapshots = Arc::new(
+            SnapshotManager::new(Path::new(&child.workspace), &snapshot_root.join(&child_id))
+                .map_err(|error| ToolError::Command(error.to_string()))?,
+        );
+        let role = if mode == SessionMode::Plan {
+            "explore"
+        } else {
+            "build"
+        };
+        let mut candidates = self
+            .model_candidates(&child, role, None)
+            .await
+            .map_err(|error| ToolError::Command(error.to_string()))?;
+        let model = candidates.remove(0);
+        let provider = self
+            .providers
+            .provider_for(&model)
+            .ok_or_else(|| ToolError::Command(format!("no provider for model {model}")))?;
+        let bundle = self
+            .context
+            .build(Path::new(&child.workspace), task)
+            .await
+            .map_err(|error| ToolError::Command(error.to_string()))?;
+        let tool_definitions = tools
+            .definitions()
+            .into_iter()
+            .map(|definition| ToolDefinition {
+                name: definition.name,
+                description: definition.description,
+                parameters: definition.parameters,
+            })
+            .collect::<Vec<_>>();
+        let mut messages = vec![
+            ChatMessage::system(bundle.system),
+            ChatMessage::user(bundle.user),
+        ];
+        let mut total_tokens = bundle.estimated_tokens as u64;
+        let mut diffs = Vec::new();
+        let started = tokio::time::Instant::now();
+        let turn_id = self.ids.new_id("turn");
+        self.append_event(
+            &child_id,
+            EventKind::TurnStarted,
+            json!({"turn_id": turn_id, "input": task, "parent_turn_id": parent_turn_id}),
+        )
+        .await
+        .map_err(|error| ToolError::Command(error.to_string()))?;
+
+        for _ in 0..SUBAGENT_MAX_ITERATIONS {
+            if started.elapsed() > SUBAGENT_MAX_TIME {
+                return Err(ToolError::Command(
+                    "subagent time budget exhausted".to_owned(),
+                ));
+            }
+            if total_tokens > SUBAGENT_MAX_TOKENS {
+                return Err(ToolError::Command(
+                    "subagent token budget exhausted".to_owned(),
+                ));
+            }
+            let request = ChatRequest {
+                model: model.clone(),
+                messages: messages.clone(),
+                tools: tool_definitions.clone(),
+                ..ChatRequest::default()
+            };
+            let mut stream = provider
+                .chat(request)
+                .await
+                .map_err(|error| ToolError::Command(error.to_string()))?;
+            let mut content = String::new();
+            let mut accumulators: HashMap<usize, ToolAccumulator> = HashMap::new();
+            loop {
+                let item = tokio::select! {
+                    () = cancel.cancelled() => {
+                        let _ = self.append_event(
+                            &child_id,
+                            EventKind::TurnCancelled,
+                            json!({"turn_id": turn_id}),
+                        ).await;
+                        return Err(ToolError::Command("subagent cancelled".to_owned()));
+                    }
+                    item = stream.next() => item,
+                };
+                match item {
+                    None => break,
+                    Some(Ok(ChatEvent::Content { text })) => {
+                        total_tokens = total_tokens.saturating_add(estimate_tokens(&text) as u64);
+                        content.push_str(&text);
+                        let _ = self
+                            .append_event(
+                                &child_id,
+                                EventKind::ModelDelta,
+                                json!({"turn_id": turn_id, "text": text}),
+                            )
+                            .await;
+                    }
+                    Some(Ok(ChatEvent::Reasoning { text })) => {
+                        total_tokens = total_tokens.saturating_add(estimate_tokens(&text) as u64);
+                        let _ = self
+                            .append_event(
+                                &child_id,
+                                EventKind::ReasoningDelta,
+                                json!({"turn_id": turn_id, "text": text}),
+                            )
+                            .await;
+                    }
+                    Some(Ok(ChatEvent::ToolCallDelta {
+                        index,
+                        id,
+                        name,
+                        arguments,
+                    })) => {
+                        let accumulator = accumulators.entry(index).or_default();
+                        if let Some(id) = id {
+                            accumulator.id = Some(id);
+                        }
+                        if let Some(name) = name {
+                            accumulator.name = Some(name);
+                        }
+                        accumulator.arguments.push_str(&arguments);
+                    }
+                    Some(Ok(ChatEvent::Usage { usage })) => {
+                        total_tokens =
+                            total_tokens.saturating_add(usage.input_tokens + usage.output_tokens);
+                    }
+                    Some(Ok(ChatEvent::Done)) => break,
+                    Some(Err(error)) => {
+                        return Err(ToolError::Command(error.to_string()));
+                    }
+                }
+            }
+
+            let mut calls = Vec::new();
+            for (_, accumulator) in accumulators {
+                let Some(name) = accumulator.name else {
+                    continue;
+                };
+                let id = accumulator.id.unwrap_or_else(|| self.ids.new_id("call"));
+                calls.push(ToolCall {
+                    id,
+                    name,
+                    arguments: accumulator.arguments,
+                });
+            }
+            if calls.is_empty() {
+                let _ = self
+                    .append_event(
+                        &child_id,
+                        EventKind::TurnCompleted,
+                        json!({
+                            "turn_id": turn_id,
+                            "parent_turn_id": parent_turn_id,
+                            "summary": truncate_text(&content, 4_000)
+                        }),
+                    )
+                    .await;
+                let mut output = format!(
+                    "subagent {kind} completed
+
+{}",
+                    truncate_text(content.trim(), 8_000)
+                );
+                if !diffs.is_empty() {
+                    output.push_str("\n\nDiff:\n");
+                    output.push_str(&truncate_text(&diffs.join("\n"), 8_000));
+                }
+                return Ok(ToolResult {
+                    content: output,
+                    is_error: false,
+                    diff: (!diffs.is_empty()).then(|| diffs.join("\n")),
+                });
+            }
+
+            let assistant_calls = calls.clone();
+            messages.push(ChatMessage::assistant(
+                (!content.trim().is_empty()).then_some(content),
+                assistant_calls,
+            ));
+            for call in calls {
+                let arguments: Value = serde_json::from_str(&call.arguments)
+                    .map_err(|error| ToolError::InvalidArgs(format!("invalid args: {error}")))?;
+                self.append_event(
+                    &child_id,
+                    EventKind::ToolCall,
+                    json!({
+                        "turn_id": turn_id,
+                        "id": call.id,
+                        "name": call.name,
+                        "arguments": call.arguments
+                    }),
+                )
+                .await
+                .map_err(|error| ToolError::Command(error.to_string()))?;
+                let decision = gate.check(
+                    &call.name,
+                    &arguments,
+                    tools.jail(),
+                    tools.is_mutating(&call.name),
+                    &tools.summary(&call.name, &arguments),
+                );
+                let decision = match decision {
+                    PermissionDecision::Allow => ApprovalDecision::Allow,
+                    PermissionDecision::Ask(reason) => self
+                        .request_approval(
+                            &parent.session_id,
+                            json!({
+                                "type": "subagent_tool",
+                                "child_session_id": child_id,
+                                "tool": call.name,
+                                "arguments": arguments,
+                                "reason": reason,
+                                "diff": tools.preview(&call.name, &arguments)
+                            }),
+                        )
+                        .await
+                        .map_err(|error| ToolError::Command(error.to_string()))?,
+                    PermissionDecision::Deny(reason) => {
+                        let result = ToolResult {
+                            content: format!("denied: {reason}"),
+                            is_error: true,
+                            diff: None,
+                        };
+                        self.append_event(
+                            &child_id,
+                            EventKind::ToolResult,
+                            json!({
+                                "turn_id": turn_id,
+                                "tool_call_id": call.id,
+                                "name": call.name,
+                                "content": result.content,
+                                "is_error": true
+                            }),
+                        )
+                        .await
+                        .map_err(|error| ToolError::Command(error.to_string()))?;
+                        messages.push(ChatMessage::tool(call.id, result.content.clone()));
+                        continue;
+                    }
+                };
+                if decision == ApprovalDecision::Deny {
+                    let result = ToolResult {
+                        content: "denied by user".to_owned(),
+                        is_error: true,
+                        diff: None,
+                    };
+                    self.append_event(
+                        &child_id,
+                        EventKind::ToolResult,
+                        json!({
+                            "turn_id": turn_id,
+                            "tool_call_id": call.id,
+                            "name": call.name,
+                            "content": result.content,
+                            "is_error": true
+                        }),
+                    )
+                    .await
+                    .map_err(|error| ToolError::Command(error.to_string()))?;
+                    messages.push(ChatMessage::tool(call.id, result.content.clone()));
+                    continue;
+                }
+
+                let mut snapshot = None;
+                if tools.is_mutating(&call.name) {
+                    snapshot = Some(
+                        snapshots
+                            .create()
+                            .map_err(|error| ToolError::Command(error.to_string()))?,
+                    );
+                }
+                let result = tools
+                    .execute(&call.name, arguments.clone())
+                    .map_err(|error| ToolError::Command(error.to_string()))?;
+                if snapshot.is_some()
+                    && let Some(verifier) = &self.verifier
+                {
+                    match verifier.run(tools.jail().root()) {
+                        Verification::Pass => {}
+                        Verification::Fail { output } => {
+                            if let Some(snapshot) = &snapshot {
+                                let _ = snapshots.restore(snapshot);
+                            }
+                            let _ = self
+                                .append_event(
+                                    &child_id,
+                                    EventKind::VerificationFailed,
+                                    json!({"turn_id": turn_id, "output": truncate_output(&output)}),
+                                )
+                                .await;
+                            return Err(ToolError::Command(
+                                "subagent verification failed; changes rolled back".to_owned(),
+                            ));
+                        }
+                        Verification::Unavailable { .. } => {}
+                    }
+                }
+                if let Some(diff) = &result.diff {
+                    diffs.push(diff.clone());
+                }
+                self.append_event(
+                    &child_id,
+                    EventKind::ToolResult,
+                    json!({
+                        "turn_id": turn_id,
+                        "tool_call_id": call.id,
+                        "name": call.name,
+                        "content": truncate_output(&result.content),
+                        "is_error": result.is_error,
+                        "diff": result.diff
+                    }),
+                )
+                .await
+                .map_err(|error| ToolError::Command(error.to_string()))?;
+                messages.push(ChatMessage::tool(call.id, result.content));
+            }
+        }
+        Err(ToolError::Command(
+            "subagent iteration budget exhausted".to_owned(),
+        ))
     }
 
     async fn build_prompt(
@@ -1998,10 +2486,23 @@ impl Runtime {
                 }
             }
 
+            let mut executed = HashMap::new();
             let mut tasks = Vec::new();
             let mut mutating_calls = Vec::new();
             for (index, item) in prepared.iter().enumerate() {
                 if let PreparedTool::Execute { call, arguments } = item {
+                    if call.name == "subagent" {
+                        let kind = arguments
+                            .get("kind")
+                            .and_then(Value::as_str)
+                            .unwrap_or("explore");
+                        let task = arguments.get("task").and_then(Value::as_str).unwrap_or("");
+                        let result = self
+                            .run_subagent(&session, kind, task, cancel, turn_id)
+                            .await;
+                        executed.insert(index, result);
+                        continue;
+                    }
                     if tools.is_mutating(&call.name) {
                         mutating_calls.push((index, call.clone(), arguments.clone()));
                     } else {
@@ -2016,7 +2517,6 @@ impl Runtime {
                 }
             }
 
-            let mut executed = HashMap::new();
             for (index, task) in tasks {
                 let result = match task.await {
                     Ok(result) => result,
@@ -2063,7 +2563,7 @@ impl Runtime {
                     }
                 };
 
-                let result = tools.execute(&call.name, arguments);
+                let result = tools.execute(&call.name, arguments.clone());
                 if cancel.is_cancelled() {
                     let restored = snapshots.restore(&snapshot).unwrap_or_default();
                     self.append_event(
@@ -2082,6 +2582,58 @@ impl Runtime {
                 }
                 match result {
                     Ok(mut result) => {
+                        if let Some(path) = arguments.get("path").and_then(Value::as_str)
+                            && let Ok(path) = tools.jail().resolve(path)
+                            && let Some(report) = tools.lsp_report(&path)
+                        {
+                            self.append_event(
+                                session_id,
+                                EventKind::LspDiagnostics,
+                                json!({
+                                    "turn_id": turn_id,
+                                    "path": tools.jail().display(&path),
+                                    "diagnostics": report.text,
+                                    "has_errors": report.has_errors
+                                }),
+                            )
+                            .await?;
+                            if report.has_errors {
+                                let restored = snapshots.restore(&snapshot).unwrap_or_default();
+                                self.append_event(
+                                    session_id,
+                                    EventKind::VerificationFailed,
+                                    json!({
+                                        "turn_id": turn_id,
+                                        "output": format!("LSP diagnostics:\n{}", report.text)
+                                    }),
+                                )
+                                .await?;
+                                self.append_event(
+                                    session_id,
+                                    EventKind::RollbackCompleted,
+                                    json!({"turn_id": turn_id, "paths": restored}),
+                                )
+                                .await?;
+                                repair_attempts += 1;
+                                executed.insert(
+                                    index,
+                                    Ok(ToolResult {
+                                        content: format!(
+                                            "LSP diagnostics failed; changes rolled back.\n{}",
+                                            report.text
+                                        ),
+                                        is_error: true,
+                                        diff: None,
+                                    }),
+                                );
+                                if repair_attempts >= 2 {
+                                    return Err(RuntimeError::InvalidRequest(
+                                        "repair budget exhausted".to_owned(),
+                                    ));
+                                }
+                                continue;
+                            }
+                        }
                         if let Some(verifier) = &self.verifier {
                             self.append_event(
                                 session_id,

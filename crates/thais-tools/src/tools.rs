@@ -11,10 +11,13 @@ use serde_json::{Value, json};
 
 use crate::bash::BashTool;
 use crate::error::ToolError;
-use crate::git::{GitDiffTool, GitStatusTool};
+use crate::git::{GitCommitTool, GitDiffTool, GitLogTool, GitShowTool, GitStatusTool};
+use crate::lsp::{LspConfig, LspManager, LspReport, tools as lsp_tools};
+use crate::mcp::{McpConfig, McpManager, McpTool};
 use crate::memory::MemoryWriteTool;
 use crate::mutating::{ApplyPatchTool, EditTool, WriteTool};
 use crate::path_jail::PathJail;
+use crate::subagent::SubagentTool;
 
 const MAX_READ_BYTES: u64 = 2_000_000;
 const MAX_OUTPUT_CHARS: usize = 200_000;
@@ -97,6 +100,9 @@ pub trait Tool: Send + Sync {
 pub struct ToolRegistry {
     jail: PathJail,
     tools: HashMap<String, Arc<dyn Tool>>,
+    lsp: Option<std::sync::Arc<std::sync::Mutex<LspManager>>>,
+    mcp: Option<std::sync::Arc<std::sync::Mutex<McpManager>>>,
+    mcp_tools: Vec<McpTool>,
 }
 
 impl ToolRegistry {
@@ -110,7 +116,16 @@ impl ToolRegistry {
         tools.insert("grep".to_owned(), Arc::new(GrepTool));
         tools.insert("git_status".to_owned(), Arc::new(GitStatusTool));
         tools.insert("git_diff".to_owned(), Arc::new(GitDiffTool));
-        Ok(Self { jail, tools })
+        tools.insert("git_log".to_owned(), Arc::new(GitLogTool));
+        tools.insert("git_show".to_owned(), Arc::new(GitShowTool));
+        tools.insert("subagent".to_owned(), Arc::new(SubagentTool));
+        Ok(Self {
+            jail,
+            tools,
+            lsp: None,
+            mcp: None,
+            mcp_tools: Vec::new(),
+        })
     }
 
     /// Build the full M2 registry for a workspace.
@@ -126,8 +141,59 @@ impl ToolRegistry {
         registry.tools.insert("bash".to_owned(), Arc::new(BashTool));
         registry
             .tools
+            .insert("git_commit".to_owned(), Arc::new(GitCommitTool));
+        registry
+            .tools
             .insert("memory_write".to_owned(), Arc::new(MemoryWriteTool));
         Ok(registry)
+    }
+
+    /// Remove one tool, used to enforce subagent depth 1.
+    #[must_use]
+    pub fn without_tool(mut self, name: &str) -> Self {
+        self.tools.remove(name);
+        self
+    }
+
+    /// Attach a lazy LSP manager and its three tools.
+    #[must_use]
+    pub fn with_lsp(mut self, config: LspConfig) -> Self {
+        if config.is_empty() {
+            return self;
+        }
+        let manager = std::sync::Arc::new(std::sync::Mutex::new(LspManager::new(
+            self.jail.root().to_path_buf(),
+            config,
+        )));
+        for (name, tool) in lsp_tools(std::sync::Arc::clone(&manager)) {
+            self.tools.insert(name.to_owned(), tool);
+        }
+        self.lsp = Some(manager);
+        self
+    }
+
+    /// Attach a stdio MCP manager and discovered tools.
+    #[must_use]
+    pub fn with_mcp(mut self, config: McpConfig) -> Self {
+        if config.is_empty() {
+            return self;
+        }
+        let manager = std::sync::Arc::new(std::sync::Mutex::new(McpManager::new(config)));
+        let tools = manager
+            .lock()
+            .map(|mut manager| manager.discover())
+            .unwrap_or_default();
+        self.mcp_tools = tools;
+        self.mcp = Some(manager);
+        self
+    }
+
+    /// Query diagnostics for one path when LSP is configured.
+    #[must_use]
+    pub fn lsp_report(&self, path: &Path) -> Option<LspReport> {
+        let manager = self.lsp.as_ref()?;
+        let mut manager = manager.lock().ok()?;
+        manager.diagnostics(path).ok()
     }
 
     /// Definitions in stable name order.
@@ -138,12 +204,25 @@ impl ToolRegistry {
             .values()
             .map(|tool| tool.definition())
             .collect::<Vec<_>>();
+        definitions.extend(self.mcp_tools.iter().map(McpTool::definition));
         definitions.sort_by(|left, right| left.name.cmp(&right.name));
         definitions
     }
 
     /// Execute a tool by name.
     pub fn execute(&self, name: &str, args: Value) -> Result<ToolResult, ToolError> {
+        if name.starts_with("mcp__") {
+            let manager = self
+                .mcp
+                .as_ref()
+                .ok_or_else(|| ToolError::UnknownTool(name.to_owned()))?;
+            let mut manager = manager
+                .lock()
+                .map_err(|_| ToolError::Command("MCP manager lock poisoned".to_owned()))?;
+            return manager
+                .call(name, args)
+                .map_err(|error| ToolError::Command(error.to_string()));
+        }
         let tool = self
             .tools
             .get(name)
@@ -154,12 +233,22 @@ impl ToolRegistry {
     /// Whether a tool may mutate the workspace.
     #[must_use]
     pub fn is_mutating(&self, name: &str) -> bool {
+        if name.starts_with("mcp__") {
+            return self
+                .mcp_tools
+                .iter()
+                .find(|tool| tool.name == name)
+                .is_none_or(|tool| !tool.read_only);
+        }
         self.tools.get(name).is_some_and(|tool| tool.mutating())
     }
 
     /// Human-readable action summary for approvals.
     #[must_use]
     pub fn summary(&self, name: &str, args: &Value) -> String {
+        if name.starts_with("mcp__") {
+            return format!("{name} {}", truncate_json(args));
+        }
         self.tools
             .get(name)
             .map_or_else(|| name.to_owned(), |tool| tool.summary(args))
@@ -499,6 +588,15 @@ pub(crate) fn cap_output(mut output: String) -> String {
     output
 }
 
+fn truncate_json(value: &Value) -> String {
+    let text = value.to_string();
+    if text.chars().count() <= 120 {
+        text
+    } else {
+        format!("{}…", text.chars().take(120).collect::<String>())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -573,7 +671,17 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            vec!["git_diff", "git_status", "glob", "grep", "list", "read"]
+            vec![
+                "git_diff",
+                "git_log",
+                "git_show",
+                "git_status",
+                "glob",
+                "grep",
+                "list",
+                "read",
+                "subagent",
+            ]
         );
     }
 }

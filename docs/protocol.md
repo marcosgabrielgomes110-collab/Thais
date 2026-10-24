@@ -1,6 +1,6 @@
 # Thais Agent API v1
 
-- Status: M4 protocol
+- Status: M5 protocol
 - Version: `1.0`
 - Transport: JSON-RPC 2.0 over stdio; one JSON message per line (NDJSON)
 - Boundary: all clients use this protocol through `thais-sdk`; no client imports core internals
@@ -58,7 +58,7 @@ the result so the client can decide how to proceed.
 | `models.list` | none | `models` |
 | `history.search` | `query`, `session_id` optional, `workspace` optional, `limit` optional | `matches` (`event`, `session_name`, `workspace`) |
 
-A session object includes `session_id`, `name`, `workspace`, `mode`, `model`,
+A session object includes `session_id`, optional `parent_id`, `name`, `workspace`, `mode`, `model`,
 `model_policy`, lifecycle `status`, timestamps, and cumulative
 `input_tokens`, `output_tokens`, and `cost_usd`. `session_id` is present from
 day one even when only one session exists.
@@ -126,6 +126,7 @@ Event kinds in v1:
 | `context_rebuilt` | `turn_id`, `older_turns`, `kept_turns`, `last_compacted_seq`, `summary_chars` |
 | `context_rebuild_failed` | `turn_id`, `message` |
 | `memory_updated` | `turn_id`, `rule`, `diff` |
+| `lsp_diagnostics` | `turn_id`, `path`, `diagnostics`, `has_errors` |
 | `snapshot_created` | `turn_id`, `commit` |
 | `rollback_completed` | `turn_id`, `paths` |
 | `verification_started` | `turn_id`, `commands` |
@@ -150,7 +151,8 @@ and error events. M1 adds read tools. M2 adds snapshots, rollback, verification,
 write/edit/patch, bash, and git read tools. M3 adds session lifecycle, model
 policy changes, budget warnings, and durable pending approvals. M4 adds
 approved project memory, context rebuilds, checkpoint summaries, and history
-search.
+search. M5 adds child sessions, LSP diagnostics, MCP tool events, and gated
+Git commits.
 
 ## Errors
 
@@ -213,6 +215,22 @@ Responses carry exactly one of `result` or `error`.
   emits `context_rebuild_failed` and falls back to the checkpoint plus memory.
 - `history.search` searches the Event Log with optional session and workspace
   filters.
+
+## M5 tool ecosystem
+
+- LSP tools are `lsp_diagnostics`, `lsp_definition`, and `lsp_references`.
+  Servers are configured in the user's `lsp.toml`; project config cannot add
+  servers. Diagnostics with error severity feed the verifier and roll back the
+  edit.
+- MCP tools are discovered from `mcp.toml` and exposed as
+  `mcp__<server>__<tool>`. Stdio and streamable HTTP are supported. Every call
+  is gated unless the server is explicitly configured `read_only = true`.
+- `subagent` accepts `kind` (`explore` or `general`) and `task`. Child sessions
+  carry `parent_id`; context is isolated and depth is limited to one. Explore is
+  read-only. General asks approval, uses the parent workspace lease, verifies
+  mutations, and rolls back on failure.
+- `git_log` and `git_show` are read-only. `git_commit` is gated and never
+  amends or rewrites history.
 
 ## Security and trust
 

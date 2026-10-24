@@ -84,7 +84,7 @@ fn doctor_reports_paths_and_fts5() {
 
     let stdout = String::from_utf8(output.stdout).expect("stdout");
     assert!(stdout.contains("SQLite FTS5 available"), "{stdout}");
-    assert!(stdout.contains("schema version: 2"), "{stdout}");
+    assert!(stdout.contains("schema version: 3"), "{stdout}");
     assert!(
         stdout.contains(temp.path().to_string_lossy().as_ref()),
         "{stdout}"

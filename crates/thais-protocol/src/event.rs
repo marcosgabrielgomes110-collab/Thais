@@ -20,6 +20,8 @@ pub enum EventKind {
     ContextRebuildFailed,
     /// An approved memory rule was written.
     MemoryUpdated,
+    /// Language-server diagnostics were collected.
+    LspDiagnostics,
     /// A pre-action snapshot was created.
     SnapshotCreated,
     /// A rollback restored a snapshot.
@@ -69,6 +71,7 @@ impl EventKind {
             Self::ContextRebuilt => "context_rebuilt",
             Self::ContextRebuildFailed => "context_rebuild_failed",
             Self::MemoryUpdated => "memory_updated",
+            Self::LspDiagnostics => "lsp_diagnostics",
             Self::SnapshotCreated => "snapshot_created",
             Self::RollbackCompleted => "rollback_completed",
             Self::VerificationStarted => "verification_started",
@@ -99,6 +102,7 @@ impl EventKind {
             "context_rebuilt" => Ok(Self::ContextRebuilt),
             "context_rebuild_failed" => Ok(Self::ContextRebuildFailed),
             "memory_updated" => Ok(Self::MemoryUpdated),
+            "lsp_diagnostics" => Ok(Self::LspDiagnostics),
             "snapshot_created" => Ok(Self::SnapshotCreated),
             "rollback_completed" => Ok(Self::RollbackCompleted),
             "verification_started" => Ok(Self::VerificationStarted),

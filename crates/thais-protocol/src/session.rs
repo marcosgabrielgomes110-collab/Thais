@@ -91,6 +91,9 @@ impl SessionStatus {
 pub struct SessionInfo {
     /// Stable session identifier.
     pub session_id: String,
+    /// Parent session for subagent child sessions.
+    #[serde(default)]
+    pub parent_id: Option<String>,
     /// Human-readable session name.
     #[serde(default)]
     pub name: String,
@@ -158,6 +161,9 @@ pub struct SessionCreateParams {
     /// Optional session name.
     #[serde(default)]
     pub name: Option<String>,
+    /// Optional parent session for subagent-created sessions.
+    #[serde(default)]
+    pub parent_id: Option<String>,
     /// Initial mode.
     #[serde(default)]
     pub mode: SessionMode,

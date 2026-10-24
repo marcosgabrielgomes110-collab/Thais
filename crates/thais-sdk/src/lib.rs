@@ -348,6 +348,7 @@ mod tests {
             .session_create(SessionCreateParams {
                 workspace: "/tmp".to_owned(),
                 name: None,
+                parent_id: None,
                 mode: SessionMode::Build,
                 model: None,
                 steal_lease: false,

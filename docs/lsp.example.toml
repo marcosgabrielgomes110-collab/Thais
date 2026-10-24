@@ -1,0 +1,18 @@
+# Copy to ~/.config/thais/lsp.toml.
+# Server commands come from user config, never from project config.
+
+[[servers]]
+id = "rust-analyzer"
+command = "rust-analyzer"
+args = []
+extensions = ["rs"]
+root_markers = ["Cargo.toml"]
+timeout_ms = 3000
+
+[[servers]]
+id = "typescript"
+command = "typescript-language-server"
+args = ["--stdio"]
+extensions = ["ts", "tsx", "js", "jsx"]
+root_markers = ["package.json", "tsconfig.json"]
+timeout_ms = 3000

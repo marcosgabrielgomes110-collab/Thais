@@ -170,7 +170,7 @@ impl Storage {
             |row| row.get(0),
         )?;
 
-        if current > 2 {
+        if current > 3 {
             return Err(StorageError::UnsupportedSchema(current));
         }
         if current == 0 {
@@ -185,6 +185,14 @@ impl Storage {
             self.conn.execute_batch(MIGRATION_2)?;
             self.conn.execute(
                 "INSERT INTO schema_migrations(version, applied_at) VALUES (2, ?1)",
+                params![Utc::now().to_rfc3339()],
+            )?;
+            current = 2;
+        }
+        if current == 2 {
+            self.conn.execute_batch(MIGRATION_3)?;
+            self.conn.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES (3, ?1)",
                 params![Utc::now().to_rfc3339()],
             )?;
         }
@@ -207,11 +215,12 @@ impl Storage {
 
         self.conn.execute(
             "INSERT INTO sessions (
-                session_id, name, workspace, canonical_workspace, mode, model,
+                session_id, parent_id, name, workspace, canonical_workspace, mode, model,
                 model_policy_json, status, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 session.session_id,
+                session.parent_id,
                 session.name,
                 session.workspace,
                 canonical,
@@ -231,7 +240,7 @@ impl Storage {
         let row = self
             .conn
             .query_row(
-                "SELECT session_id, name, workspace, mode, model, model_policy_json,
+                "SELECT session_id, parent_id, name, workspace, mode, model, model_policy_json,
                         input_tokens, output_tokens, cost_usd, status, created_at, updated_at
                  FROM sessions WHERE session_id = ?1",
                 params![session_id],
@@ -257,12 +266,12 @@ impl Storage {
         include_archived: bool,
     ) -> Result<Vec<SessionInfo>, StorageError> {
         let sql = if include_archived {
-            "SELECT session_id, name, workspace, mode, model, model_policy_json,
+            "SELECT session_id, parent_id, name, workspace, mode, model, model_policy_json,
                     input_tokens, output_tokens, cost_usd, status, created_at, updated_at
              FROM sessions WHERE status != 'deleted'
              ORDER BY created_at ASC, session_id ASC"
         } else {
-            "SELECT session_id, name, workspace, mode, model, model_policy_json,
+            "SELECT session_id, parent_id, name, workspace, mode, model, model_policy_json,
                     input_tokens, output_tokens, cost_usd, status, created_at, updated_at
              FROM sessions WHERE status != 'deleted' AND status != 'archived'
              ORDER BY created_at ASC, session_id ASC"
@@ -1111,6 +1120,7 @@ impl StorageHandle {
 
 struct SessionRow {
     session_id: String,
+    parent_id: Option<String>,
     name: String,
     workspace: String,
     mode: String,
@@ -1128,23 +1138,25 @@ impl SessionRow {
     fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
         Ok(Self {
             session_id: row.get(0)?,
-            name: row.get(1)?,
-            workspace: row.get(2)?,
-            mode: row.get(3)?,
-            model: row.get(4)?,
-            model_policy_json: row.get(5)?,
-            input_tokens: row.get::<_, i64>(6)? as u64,
-            output_tokens: row.get::<_, i64>(7)? as u64,
-            cost_usd: row.get(8)?,
-            status: row.get(9)?,
-            created_at: row.get(10)?,
-            updated_at: row.get(11)?,
+            parent_id: row.get(1)?,
+            name: row.get(2)?,
+            workspace: row.get(3)?,
+            mode: row.get(4)?,
+            model: row.get(5)?,
+            model_policy_json: row.get(6)?,
+            input_tokens: row.get::<_, i64>(7)? as u64,
+            output_tokens: row.get::<_, i64>(8)? as u64,
+            cost_usd: row.get(9)?,
+            status: row.get(10)?,
+            created_at: row.get(11)?,
+            updated_at: row.get(12)?,
         })
     }
 
     fn into_session(self) -> Result<SessionInfo, StorageError> {
         Ok(SessionInfo {
             session_id: self.session_id,
+            parent_id: self.parent_id,
             name: self.name,
             workspace: self.workspace,
             mode: SessionMode::parse(&self.mode)?,
@@ -1331,4 +1343,8 @@ CREATE TABLE IF NOT EXISTS workspace_leases (
     heartbeat_at TEXT NOT NULL,
     expires_at TEXT NOT NULL
 );
+"#;
+
+const MIGRATION_3: &str = r#"
+ALTER TABLE sessions ADD COLUMN parent_id TEXT;
 "#;
