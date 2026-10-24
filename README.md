@@ -75,11 +75,11 @@ flowchart TD
     RC -->|compact context| C
 ```
 
-`Agent API` is the only client-facing boundary. The TUI and CLI never import core packages or touch the database directly; they send commands and receive events through the API. `Plan Approval` is the only path from plan mode to build mode. `MEMORY.md` is written by Thais, not by a tool, and only after the gate's `allow memory` decision.
+`Agent API` is the only client-facing boundary for TUI, web, and IDE. The CLI is the local composition root: it hosts `thais serve`, exposes the client commands, and keeps the local admin commands (`doctor`, `auth`, `trust`). TUI, web, and IDE never import core packages or touch the database directly; they send commands and receive events through the API. `Plan Approval` is the only path from plan mode to build mode. `MEMORY.md` is written by Thais, not by a tool, and only after the gate's `allow memory` decision.
 
 ## Summary
 
-Thais is a headless coding agent. It helps a user write code and runs an explicit loop: assemble, decide, authorize, act, verify, and persist. The model proposes a step. TUI, CLI, web, and IDE are clients of the Agent API; none of them call the core directly. Plans in plan mode go to the user for approval; approval switches to build mode, rejection returns to plan mode. Tool calls, subagent tasks, and memory writes go through the Permission Gate; final answers return through the API to the TUI. Until the OS sandbox lands, `bash` is always `ask`; the workspace path jail is not isolation. Tools or subagents execute approved actions. The Verifier checks only actions that changed code or project files, and Rollback restores Thais's own changes to the last good state on failure.
+Thais is a headless coding agent. It helps a user write code and runs an explicit loop: assemble, decide, authorize, act, verify, and persist. The model proposes a step. TUI, web, and IDE are clients of the Agent API; the CLI is the local composition root that hosts the server and exposes client commands. TUI, web, and IDE never call the core directly. Plans in plan mode go to the user for approval; approval switches to build mode, rejection returns to plan mode. Tool calls, subagent tasks, and memory writes go through the Permission Gate; final answers return through the API to the TUI. Until the OS sandbox lands, `bash` is always `ask`; the workspace path jail is not isolation. Tools or subagents execute approved actions. The Verifier checks only actions that changed code or project files, and Rollback restores Thais's own changes to the last good state on failure.
 
 The Event Log is the source of truth: the `events` table in `thais.db`. `MEMORY.md` and `checkpoint.md` are curated stores: long-term approved rules and the current session state. The derived `events_fts` index lives in the same database, not in a second store. When the context approaches the token limit, the Context Manager signals Thais, which rebuilds at a safe point after a write-ahead checkpoint.
 
@@ -110,7 +110,7 @@ If the rebuild fails, Thais falls back to the checkpoint plus `MEMORY.md` and co
 | Part | Description |
 |---|---|
 | User | The person who gives the task. |
-| TUI and CLI | The text interface. It streams output, shows diffs, reviews plans, asks for approvals, and cancels. It is a client and never imports the core. |
+| TUI and CLI | The text interface. It streams output, shows diffs, reviews plans, asks for approvals, and cancels. The TUI is a pure client; the CLI is the local composition root that hosts `serve` and admin commands. |
 | Agent API | The only client-facing boundary. It routes sessions and commands, streams events, and serves JSON-RPC over stdio for local single-client use and WebSocket for multi-client daemon, web, and IDE clients (M7). |
 | Thais | The main agent and orchestrator. It owns the loop state machine, the active mode, the budgets, the checkpoint, log, and approved memory writes, and the rebuild coordination. |
 | Plan Approval (state) | The explicit state where the user approves or rejects the plan. Approval switches from plan mode to build mode; rejection returns to plan mode. |
@@ -181,7 +181,7 @@ If the rebuild fails, Thais falls back to the checkpoint plus `MEMORY.md` and co
 9. Every loop has a budget for iterations, tokens, cost, and time. Exhausting it ends in `failed` or an explicit user decision, never in silence.
 10. The workspace path jail is not a sandbox. Until the OS sandbox lands in M6, `bash` always requires `ask`; allow-always and prefix allowlists are disabled. Path traversal, network access, and secret exposure remain policy decisions, not model choices.
 11. Secrets are redacted before an event is appended or a prompt is assembled. Raw credentials never enter the log, the search index, or the model context.
-12. The Agent API is the only client-facing boundary. TUI, CLI, web, and IDE import only the protocol or client SDK; no client imports core internals or reads SQLite, checkpoints, or memory files directly. stdout is protocol-only; logs go to stderr.
+12. The Agent API is the only client-facing boundary. TUI, web, and IDE import only the protocol or client SDK; none of them imports core internals or reads SQLite, checkpoints, or memory files directly. The CLI is the local composition root: it hosts `thais serve` and the local admin commands (`doctor`, `auth`, `trust`), while its client commands use the API or SDK. stdout is protocol-only; logs go to stderr.
 13. `<repo>/.thais/config.toml` is untrusted repository content, at the same trust level as project `AGENTS.md`. It cannot define or override providers, `base_url`, auth, permissions or policy, verifier commands, or sandbox level. Trust is stored in Data, keyed by canonical workspace path plus config hash. Project config cannot grant permissions or bypass the gate.
 14. stdio is single-client. Multi-client per session is available only through the daemon and WebSocket (M7); approvals are first-wins and broadcast as `permission.resolved`.
 

@@ -13,6 +13,8 @@
 Each line on `stdin`/`stdout` is one complete JSON-RPC message. A message must
 not contain a raw newline; JSON string escaping keeps it on one line. Empty
 lines are ignored. The server replies with a parse error for a malformed line.
+Responses and notifications may interleave; clients route responses by `id`
+and events by `method`.
 
 WebSocket transport (M7) uses the same message objects with one JSON message
 per WebSocket frame.

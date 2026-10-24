@@ -12,7 +12,7 @@
 
 Thais is a local-first coding agent with a headless core and API-only clients. It can plan, edit, verify, and recover, while the user keeps control through explicit permissions, sessions, and model selection.
 
-The core never imports a TUI, web framework, or IDE SDK. TUI, CLI, web, and IDE are clients of the same versioned protocol.
+The core never imports a TUI, web framework, or IDE SDK. TUI, web, and IDE are clients of the same versioned protocol; the CLI is the local composition root.
 
 ## Core and client boundary
 
@@ -20,16 +20,16 @@ Thais runs as a headless core. Clients never import core packages and never read
 
 | Client | Transport | Notes |
 |---|---|---|
-| TUI and CLI | stdio JSON-RPC | Local process, no port, single client |
+| TUI and CLI | stdio JSON-RPC | Local process, no port, single client; the CLI also hosts `serve` and local admin commands |
 | Web and IDE | WebSocket JSON-RPC | Localhost daemon with token auth, multi-client per session (M7) |
 | Tests | In-process transport | Same protocol, no direct core calls |
 
 Rules:
 
-- The API is the only path into the core. TUI, CLI, web, and IDE are clients.
+- The API is the only path into the core for TUI, web, and IDE. The CLI is the local composition root for `serve` and local admin commands.
 - stdio is single-client. Multi-client per session is a daemon/WebSocket feature delivered in M7.
 - Core packages never import UI frameworks or IDE SDKs.
-- Clients never read SQLite, checkpoints, or `MEMORY.md` directly.
+- TUI, web, and IDE never read SQLite, checkpoints, or `MEMORY.md` directly. The CLI's local admin commands may read storage for diagnostics; they do not expose it to other clients.
 - stdout is protocol-only; logs go to stderr.
 - CI runs `cargo tree -p thais-tui` and fails if it depends on `thais-core`.
 - The Session Manager, model policy, and provider adapters live behind the API; they are not UI concerns.
