@@ -20,7 +20,7 @@ ifneq ($(WORKSPACE),)
 TUI_ARGS += --workspace "$(WORKSPACE)"
 endif
 
-.PHONY: all setup tools check fmt fmt-check lint test boundary build run tui fake cohere install uninstall clean ci audit doctor help
+.PHONY: all setup tools check fmt fmt-check lint test boundary build run tui fake cohere install uninstall clean ci audit doctor sbom fuzz-check fuzz help
 
 all: setup check build
 
@@ -103,6 +103,16 @@ audit:
 doctor: build
 	"$(TARGET)" doctor
 
+sbom:
+	python3 scripts/sbom.py target/thais-sbom.cdx.json
+
+fuzz-check:
+	cargo check --manifest-path fuzz/Cargo.toml
+
+fuzz:
+	scripts/fuzz.sh
+
+
 help:
 	@printf '%s\n' \
 		'Thais development tasks' \
@@ -128,4 +138,7 @@ help:
 		'  make ci           setup + check + build' \
 		'  make audit        cargo audit + cargo deny' \
 		'  make doctor       run thais doctor' \
+		'  make sbom         generate target/thais-sbom.cdx.json' \
+		'  make fuzz-check   type-check the cargo-fuzz targets' \
+		'  make fuzz         run cargo-fuzz for 30 seconds per target' \
 		'  make help         show this help'

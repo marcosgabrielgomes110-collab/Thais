@@ -82,3 +82,13 @@ jobs:
           cache-dependency-path: extensions/vscode/package-lock.json
       - run: npm ci
       - run: npm run compile
+
+  fuzz-check:
+    name: Fuzz targets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.1
+      - run: cargo check --manifest-path fuzz/Cargo.toml

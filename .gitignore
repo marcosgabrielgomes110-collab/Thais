@@ -7,3 +7,5 @@
 .DS_Store
 extensions/vscode/node_modules
 extensions/vscode/out
+/fuzz/target
+/fuzz/artifacts

@@ -326,6 +326,7 @@ performance. macOS e Windows ficam fora do escopo do v1.0.
 | [PERSONALITY.md](PERSONALITY.md) | tom e estilo do agente |
 | [docs/install.md](docs/install.md) | instalação, Docker e artefatos |
 | [CHANGELOG.md](CHANGELOG.md) | histórico de releases |
+| [docs/release.md](docs/release.md) | build, SBOM, assinatura e verificação |
 
 ## Desenvolvimento
 
@@ -333,7 +334,10 @@ performance. macOS e Windows ficam fora do escopo do v1.0.
 make check      # fmt, clippy, testes e boundary arquitetural
 make build      # release build
 cargo deny check
-scripts/release.sh v0.8.0-m7
+make sbom       # CycloneDX SBOM
+make fuzz-check # type-check fuzz targets
+scripts/release.sh v1.0.0 --allow-unsigned  # local release check
+scripts/verify-release.sh
 ```
 
 A CI roda em Linux, além de audit de dependências.

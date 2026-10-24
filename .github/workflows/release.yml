@@ -1,0 +1,58 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Signed release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.1
+          components: rustfmt, clippy
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
+
+      - name: Check
+        run: make check
+
+      - name: Build, SBOM, checksums, and signature
+        env:
+          THAIS_SIGNING_KEY: ${{ secrets.THAIS_SIGNING_KEY }}
+        run: ./scripts/release.sh "$GITHUB_REF_NAME"
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: thais-${{ github.ref_name }}
+          path: |
+            target/release/thais
+            target/release/thais-sandbox
+            target/release/thais-sbom.cdx.json
+            target/release/SHA256SUMS
+            target/release/SHA256SUMS.asc
+            target/release/thais-sbom.cdx.json.asc
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            target/release/thais \
+            target/release/thais-sandbox \
+            target/release/thais-sbom.cdx.json \
+            target/release/SHA256SUMS \
+            target/release/SHA256SUMS.asc \
+            target/release/thais-sbom.cdx.json.asc \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file CHANGELOG.md

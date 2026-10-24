@@ -753,8 +753,8 @@ fuzzing/loom, environment-leak coverage, signing/SBOM, and the performance pass.
 
 - Daemon mode with WebSocket API, localhost token auth, and multi-client per session. Approvals are first-wins and broadcast as `permission.resolved`; stdio remains single-client.
 - VS Code extension as the v1 second client: session list, diffs, approvals, model picker, usage, and history ([ADR-0005](docs/adr/0005-second-client.md)). The web UI remains a post-v1 candidate.
-- Packaging: `cargo-dist`, Homebrew, Scoop, Docker, checksums, SBOM, and signing.
-- Observability: structured logs, OpenTelemetry traces, `thais doctor`, `thais events --follow`.
+- Packaging: `cargo-dist`, shell installer, Docker, checksums, SBOM, and signing.
+- Observability: structured logs, `thais doctor`, `thais events --follow`.
 - Documentation: install, quickstart, configuration, security, architecture, protocol, contributing.
 - Release process: semantic versioning, protocol versioning, changelog, upgrade notes.
 - v1.0 release criteria review.
@@ -843,7 +843,7 @@ changelog. Signed artifacts and SBOM generation remain release-gate work.
 - TUI and the VS Code extension use the same API.
 - No gate bypass, no secret leak, and no write outside the workspace by default.
 - Crash recovery and workspace lease behavior are tested.
-- Unit, concurrency, contract, and end-to-end tests pass on three platforms.
+- Unit, concurrency, contract, and end-to-end tests pass on Linux.
 - Documentation covers install, configuration, security, and architecture.
 
 ## Risks and mitigations
