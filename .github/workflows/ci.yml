@@ -79,3 +79,27 @@ jobs:
 
       - name: cargo check
         run: cargo check --workspace --all-targets
+
+  container-smoke:
+    name: Clean install container
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and run clean container
+        run: ./scripts/clean-install.sh
+
+  vscode-extension:
+    name: VS Code extension
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: extensions/vscode
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: extensions/vscode/package-lock.json
+      - run: npm ci
+      - run: npm run compile
