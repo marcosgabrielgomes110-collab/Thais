@@ -34,4 +34,7 @@ pub enum ToolError {
     /// A binary file was requested as text.
     #[error("binary file is not readable as text: {0}")]
     Binary(PathBuf),
+    /// A shell command could not be spawned or managed.
+    #[error("command error: {0}")]
+    Command(String),
 }

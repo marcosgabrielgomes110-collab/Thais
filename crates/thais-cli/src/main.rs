@@ -8,10 +8,11 @@ use std::sync::Arc;
 
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand, ValueEnum};
-use thais_core::{ContextManager, Runtime, SystemClock, UuidGenerator};
+use thais_core::{ContextManager, Runtime, SystemClock, UuidGenerator, Verifier};
 use thais_protocol::event::{EventEnvelope, EventKind};
 use thais_protocol::jsonrpc::{Message, Notification};
 use thais_protocol::method;
+use thais_protocol::session::SessionMode;
 use thais_providers::{
     COHERE_DEFAULT_MODEL, FakeProvider, FakeScript, FakeStep, OpenAiCompatibleProvider, Provider,
 };
@@ -52,6 +53,9 @@ enum Command {
         /// Provider backend.
         #[arg(long, value_enum)]
         provider: Option<ProviderChoice>,
+        /// Session mode.
+        #[arg(long, value_enum)]
+        mode: Option<ModeChoice>,
         /// Model identifier.
         #[arg(long)]
         model: Option<String>,
@@ -73,6 +77,9 @@ enum Command {
         /// Provider backend.
         #[arg(long, value_enum)]
         provider: Option<ProviderChoice>,
+        /// Session mode.
+        #[arg(long, value_enum)]
+        mode: Option<ModeChoice>,
         /// Model identifier.
         #[arg(long)]
         model: Option<String>,
@@ -104,6 +111,23 @@ enum ProviderChoice {
     Fake,
     /// Cohere through the OpenAI-compatible Compatibility API.
     Cohere,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ModeChoice {
+    /// Read-only planning.
+    Plan,
+    /// Build mode with mutations.
+    Build,
+}
+
+impl From<ModeChoice> for SessionMode {
+    fn from(value: ModeChoice) -> Self {
+        match value {
+            ModeChoice::Plan => Self::Plan,
+            ModeChoice::Build => Self::Build,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -151,17 +175,38 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Run {
             provider,
+            mode,
             model,
             fake,
             json,
             task,
             workspace,
-        } => run(fake, provider, model, json, task, workspace).await,
+        } => {
+            run(
+                fake,
+                provider,
+                mode.unwrap_or(ModeChoice::Build),
+                model,
+                json,
+                task,
+                workspace,
+            )
+            .await
+        }
         Command::Tui {
             provider,
+            mode,
             model,
             workspace,
-        } => tui(provider, model, workspace).await,
+        } => {
+            tui(
+                provider,
+                mode.unwrap_or(ModeChoice::Build),
+                model,
+                workspace,
+            )
+            .await
+        }
         Command::Doctor => doctor(),
         Command::Auth { command } => auth(command),
         Command::Trust { status, remove } => trust(status, remove),
@@ -200,18 +245,23 @@ fn build_runtime(
         }
     };
 
-    Ok(Arc::new(Runtime::new(
-        storage,
-        provider,
-        Arc::new(SystemClock),
-        Arc::new(UuidGenerator),
-        ContextManager::new(paths),
-    )))
+    Ok(Arc::new(
+        Runtime::new(
+            storage,
+            provider,
+            Arc::new(SystemClock),
+            Arc::new(UuidGenerator),
+            ContextManager::new(paths.clone()),
+        )
+        .with_snapshot_base(paths.snapshots_dir())
+        .with_verifier(Verifier::load(&paths.config_file("verifier.toml"))?),
+    ))
 }
 
 async fn run(
     fake: Option<PathBuf>,
     provider: Option<ProviderChoice>,
+    mode: ModeChoice,
     model: Option<String>,
     json: bool,
     task: Option<String>,
@@ -224,7 +274,12 @@ async fn run(
     let task = task.unwrap_or_else(|| "Say hello from the fake provider.".to_owned());
     let runtime = build_runtime(fake, provider, model)?;
     let (session, turn_id, events) = runtime
-        .run_once(workspace.to_string_lossy().into_owned(), task, None)
+        .run_once_mode(
+            workspace.to_string_lossy().into_owned(),
+            task,
+            None,
+            mode.into(),
+        )
         .await?;
 
     if json {
@@ -246,6 +301,7 @@ async fn run(
 
 async fn tui(
     provider: Option<ProviderChoice>,
+    mode: ModeChoice,
     model: Option<String>,
     workspace: Option<PathBuf>,
 ) -> anyhow::Result<()> {
@@ -310,7 +366,7 @@ async fn tui(
     });
 
     let client = thais_sdk::Client::new(client_transport);
-    thais_tui::run(client, workspace, model).await?;
+    thais_tui::run(client, workspace, model, mode.into()).await?;
     Ok(())
 }
 
@@ -353,12 +409,69 @@ fn print_human(events: &[EventEnvelope]) {
                     .unwrap_or("unknown error");
                 let _ = writeln!(stderr, "error: {message}");
             }
-            EventKind::SessionCreated
-            | EventKind::TurnStarted
-            | EventKind::ToolCall
-            | EventKind::ToolResult
-            | EventKind::PermissionRequested
-            | EventKind::PermissionResolved => {}
+            EventKind::ToolCall => {
+                let name = event
+                    .payload
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("tool");
+                let args = event
+                    .payload
+                    .get("arguments")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                let _ = writeln!(stderr, "tool: {name} {args}");
+            }
+            EventKind::ToolResult => {
+                if let Some(diff) = event
+                    .payload
+                    .get("diff")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    let _ = writeln!(stderr, "{diff}");
+                }
+            }
+            EventKind::PermissionRequested => {
+                let _ = writeln!(stderr, "permission requested");
+            }
+            EventKind::PermissionGranted => {
+                let _ = writeln!(stderr, "permission granted");
+            }
+            EventKind::PermissionDenied => {
+                let _ = writeln!(stderr, "permission denied");
+            }
+            EventKind::PermissionResolved => {
+                let _ = writeln!(stderr, "permission resolved");
+            }
+            EventKind::SnapshotCreated => {
+                let _ = writeln!(stderr, "snapshot created");
+            }
+            EventKind::RollbackCompleted => {
+                let _ = writeln!(stderr, "changes rolled back");
+            }
+            EventKind::VerificationStarted => {
+                let _ = writeln!(stderr, "verifying...");
+            }
+            EventKind::VerificationPassed => {
+                let _ = writeln!(stderr, "verification passed");
+            }
+            EventKind::VerificationFailed => {
+                let output = event
+                    .payload
+                    .get("output")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                let _ = writeln!(stderr, "verification failed:\n{output}");
+            }
+            EventKind::VerificationUnavailable => {
+                let reason = event
+                    .payload
+                    .get("reason")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unavailable");
+                let _ = writeln!(stderr, "verification unavailable: {reason}");
+            }
+            EventKind::SessionCreated | EventKind::TurnStarted => {}
         }
     }
 }

@@ -284,6 +284,7 @@ The workspace is a Rust workspace with a single `thais` binary and a
 | `make check` | Format check, clippy, tests, and the architecture boundary |
 | `make run ARGS="run --task hello"` | Run the fake-provider M0 flow |
 | `make tui PROVIDER=cohere` | Open the TUI with the real Cohere provider (`make tui cohere` also works) |
+| `make tui cohere MODE=plan` | Start the TUI in plan mode; approval switches to build |
 | `make run ARGS="doctor"` | Validate paths, permissions, keyring, and FTS5 |
 | `make tools` | Install `cargo-nextest`, `cargo-audit`, and `cargo-deny` |
 | `make install PREFIX=...` | Install the binary; `make uninstall` removes only the binary |
@@ -314,6 +315,27 @@ The TUI keys are: `Enter` send, `Esc` cancel the active turn (or quit when idle)
 `PageUp`/`PageDown` scroll, `Ctrl+C` quit, and `y`/`n` for approval prompts.
 The headless `thais run` command prints model text to stdout and logs to stderr;
 `--json` emits the NDJSON event stream.
+
+### M2 build safety
+
+- Plan mode: `thais run --mode plan` or `thais tui --mode plan`. A completed
+  plan asks for approval; approval is the only transition to build mode.
+- Build mutations (`write`, `edit`, `apply_patch`) ask with a diff preview.
+  `bash` always asks until M6.
+- Before every mutation the runtime writes a shadow-Git snapshot. On tool
+  failure or verifier failure it restores that snapshot and reports what was
+  rolled back.
+- The verifier reads user configuration from
+  `~/.config/thais/verifier.toml`; copy
+  [docs/verifier.example.toml](docs/verifier.example.toml) as a starting point.
+  Project config cannot supply verifier commands. Without a config, mutations
+  are marked unverified.
+- Snapshots honor `.gitignore`; changes to ignored files are a known
+  best-effort limitation. Bash can still write outside the path jail because it
+  is not an OS sandbox, so every bash call requires approval.
+- Personality: edit [PERSONALITY.md](PERSONALITY.md) for this project, or
+  `~/.config/thais/PERSONALITY.md` for all projects. Personality shapes tone
+  and style but never overrides safety, the gate, or the workspace jail.
 
 ## Out of scope
 

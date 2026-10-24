@@ -27,17 +27,30 @@ fn runtime(temp: &TempDir, script: FakeScript) -> Arc<Runtime> {
 }
 
 fn runtime_with_scripts(temp: &TempDir, scripts: Vec<FakeScript>) -> Arc<Runtime> {
+    runtime_with_options(temp, scripts, None)
+}
+
+fn runtime_with_options(
+    temp: &TempDir,
+    scripts: Vec<FakeScript>,
+    verifier: Option<thais_core::Verifier>,
+) -> Arc<Runtime> {
     let storage =
         thais_storage::StorageHandle::open(temp.path().join("thais.db")).expect("storage");
     let provider: Arc<dyn thais_providers::Provider> =
         Arc::new(FakeProvider::with_scripts("fake", scripts));
-    Arc::new(Runtime::new(
+    let mut runtime = Runtime::new(
         storage,
         provider,
         Arc::new(FixedClock::new("2026-10-23T00:00:00Z")),
         Arc::new(SequenceIdGenerator::new("t")),
         ContextManager::empty(),
-    ))
+    )
+    .with_snapshot_base(temp.path().join("snapshots"));
+    if let Some(verifier) = verifier {
+        runtime = runtime.with_verifier(verifier);
+    }
+    Arc::new(runtime)
 }
 
 #[tokio::test]
@@ -578,4 +591,217 @@ async fn replay_reconstructs_the_transcript_from_the_event_log() {
     assert_eq!(replay.transcript, "replayed hello");
     assert_eq!(replay.last_seq, events.last().expect("last").seq);
     assert_eq!(replay.events.len(), events.len());
+}
+
+#[tokio::test]
+async fn write_requires_approval_and_reports_a_diff() {
+    let temp = tempfile::tempdir().expect("temp");
+    let runtime = runtime_with_scripts(
+        &temp,
+        vec![
+            script(vec![FakeStep::ToolCall {
+                index: 0,
+                id: "call_1".to_owned(),
+                name: "write".to_owned(),
+                arguments: json!({"path": "hello.txt", "content": "hello\n"}).to_string(),
+            }]),
+            script(vec![FakeStep::Text {
+                text: "done".to_owned(),
+            }]),
+        ],
+    );
+    let mut live = runtime.subscribe_live();
+    let session = runtime
+        .create_session(
+            temp.path().to_string_lossy().into_owned(),
+            SessionMode::Build,
+            None,
+        )
+        .await
+        .expect("session");
+    runtime
+        .send(&session.session_id, "write a file".to_owned(), None)
+        .await
+        .expect("send");
+
+    let mut kinds = Vec::new();
+    let mut tool_result = None;
+    tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            let event = live.recv().await.expect("event");
+            if event.session_id != session.session_id {
+                continue;
+            }
+            kinds.push(event.kind);
+            match event.kind {
+                EventKind::PermissionRequested => {
+                    let action = &event.payload["action"];
+                    assert_eq!(action["tool"], "write");
+                    assert!(action["diff"].as_str().unwrap_or("").contains("+hello"));
+                    runtime
+                        .approve(
+                            &session.session_id,
+                            event.payload["approval_id"].as_str().expect("approval id"),
+                            ApprovalDecision::Allow,
+                        )
+                        .await
+                        .expect("approve");
+                }
+                EventKind::ToolResult => tool_result = Some(event),
+                EventKind::TurnCompleted => break,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("turn");
+
+    assert!(kinds.contains(&EventKind::SnapshotCreated));
+    assert!(kinds.contains(&EventKind::ToolCall));
+    assert!(kinds.contains(&EventKind::ToolResult));
+    let result = tool_result.expect("tool result");
+    assert_eq!(result.payload["is_error"], false);
+    assert!(
+        result.payload["diff"]
+            .as_str()
+            .unwrap_or("")
+            .contains("+hello")
+    );
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("hello.txt")).expect("file"),
+        "hello\n"
+    );
+}
+
+#[tokio::test]
+async fn failing_verifier_rolls_back_the_write() {
+    let temp = tempfile::tempdir().expect("temp");
+    std::fs::write(temp.path().join("file.txt"), "old\n").expect("file");
+    let runtime = runtime_with_options(
+        &temp,
+        vec![
+            script(vec![FakeStep::ToolCall {
+                index: 0,
+                id: "call_1".to_owned(),
+                name: "write".to_owned(),
+                arguments: json!({"path": "file.txt", "content": "new\n"}).to_string(),
+            }]),
+            script(vec![FakeStep::Text {
+                text: "done".to_owned(),
+            }]),
+        ],
+        Some(thais_core::Verifier::new(
+            vec!["false".to_owned()],
+            Duration::from_secs(5),
+        )),
+    );
+    let mut live = runtime.subscribe_live();
+    let session = runtime
+        .create_session(
+            temp.path().to_string_lossy().into_owned(),
+            SessionMode::Build,
+            None,
+        )
+        .await
+        .expect("session");
+    runtime
+        .send(&session.session_id, "change the file".to_owned(), None)
+        .await
+        .expect("send");
+
+    let mut kinds = Vec::new();
+    let mut tool_result = None;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let event = live.recv().await.expect("event");
+            if event.session_id != session.session_id {
+                continue;
+            }
+            kinds.push(event.kind);
+            match event.kind {
+                EventKind::PermissionRequested => {
+                    runtime
+                        .approve(
+                            &session.session_id,
+                            event.payload["approval_id"].as_str().expect("approval id"),
+                            ApprovalDecision::Allow,
+                        )
+                        .await
+                        .expect("approve");
+                }
+                EventKind::ToolResult => tool_result = Some(event),
+                EventKind::TurnCompleted => break,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("turn");
+
+    assert!(kinds.contains(&EventKind::VerificationFailed));
+    assert!(kinds.contains(&EventKind::RollbackCompleted));
+    let result = tool_result.expect("tool result");
+    assert_eq!(result.payload["is_error"], true);
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("file.txt")).expect("file"),
+        "old\n"
+    );
+}
+
+#[tokio::test]
+async fn plan_mode_requires_approval_before_switching_to_build() {
+    let temp = tempfile::tempdir().expect("temp");
+    let runtime = runtime_with_scripts(
+        &temp,
+        vec![script(vec![FakeStep::Text {
+            text: "# Plan\n1. Read the file.".to_owned(),
+        }])],
+    );
+    let mut live = runtime.subscribe_live();
+    let session = runtime
+        .create_session(
+            temp.path().to_string_lossy().into_owned(),
+            SessionMode::Plan,
+            None,
+        )
+        .await
+        .expect("session");
+    runtime
+        .send(&session.session_id, "make a plan".to_owned(), None)
+        .await
+        .expect("send");
+
+    tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            let event = live.recv().await.expect("event");
+            if event.session_id != session.session_id {
+                continue;
+            }
+            if event.kind == EventKind::PermissionRequested {
+                assert_eq!(event.payload["action"]["type"], "plan");
+                runtime
+                    .approve(
+                        &session.session_id,
+                        event.payload["approval_id"].as_str().expect("approval id"),
+                        ApprovalDecision::Allow,
+                    )
+                    .await
+                    .expect("approve");
+            }
+            if event.kind == EventKind::TurnCompleted {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("plan approval");
+
+    assert_eq!(
+        runtime
+            .get_session(&session.session_id)
+            .await
+            .expect("session")
+            .mode,
+        SessionMode::Build
+    );
 }

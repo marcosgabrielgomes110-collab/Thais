@@ -1,8 +1,17 @@
-//! M1 permission policy for read-only tools.
+//! Permission policy for read-only and mutating tools.
 
 use serde_json::Value;
 
 use crate::path_jail::PathJail;
+
+/// Session policy mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyMode {
+    /// Read-only planning.
+    Plan,
+    /// Build mode; mutations are allowed after approval.
+    Build,
+}
 
 /// Gate decision for a proposed tool call.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -15,33 +24,74 @@ pub enum PermissionDecision {
     Deny(String),
 }
 
-/// Read-only permission policy.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct PermissionGate;
+/// Permission policy.
+#[derive(Debug, Clone, Copy)]
+pub struct PermissionGate {
+    mode: PolicyMode,
+}
 
 impl PermissionGate {
-    /// Check a tool call against the M1 policy.
+    /// Build a gate for a mode.
     #[must_use]
-    pub fn check(&self, tool: &str, args: &Value, jail: &PathJail) -> PermissionDecision {
-        if !matches!(tool, "read" | "list" | "glob" | "grep") {
-            return PermissionDecision::Deny(format!("tool `{tool}` is not available in M1"));
+    pub fn new(mode: PolicyMode) -> Self {
+        Self { mode }
+    }
+
+    /// Check a tool call against the active mode and policy.
+    #[must_use]
+    pub fn check(
+        &self,
+        tool: &str,
+        args: &Value,
+        jail: &PathJail,
+        mutating: bool,
+        summary: &str,
+    ) -> PermissionDecision {
+        const KNOWN: &[&str] = &[
+            "read",
+            "list",
+            "glob",
+            "grep",
+            "git_status",
+            "git_diff",
+            "write",
+            "edit",
+            "apply_patch",
+            "bash",
+        ];
+        if !KNOWN.contains(&tool) {
+            return PermissionDecision::Deny(format!("tool `{tool}` is not available"));
         }
 
-        if let Some(path) = args.get("path").and_then(Value::as_str) {
-            let resolved = match jail.resolve(path) {
-                Ok(resolved) => resolved,
-                Err(error) => return PermissionDecision::Deny(error.to_string()),
-            };
-            if is_git_internal(&resolved, jail) {
-                return PermissionDecision::Deny("git internals are not readable in M1".to_owned());
+        if mutating {
+            if self.mode == PolicyMode::Plan {
+                return PermissionDecision::Deny(
+                    "plan mode is read-only; approve the plan before changing files".to_owned(),
+                );
             }
-            if is_sensitive(&resolved) {
-                return PermissionDecision::Ask(format!(
-                    "read sensitive file {}",
-                    jail.display(&resolved)
-                ));
+            return PermissionDecision::Ask(summary.to_owned());
+        }
+
+        for key in ["path", "cwd"] {
+            if let Some(path) = args.get(key).and_then(Value::as_str) {
+                let resolved = match jail.resolve(path) {
+                    Ok(resolved) => resolved,
+                    Err(error) => return PermissionDecision::Deny(error.to_string()),
+                };
+                if is_git_internal(&resolved, jail) {
+                    return PermissionDecision::Deny(
+                        "git internals are not readable in M2".to_owned(),
+                    );
+                }
+                if is_sensitive(&resolved) {
+                    return PermissionDecision::Ask(format!(
+                        "read sensitive file {}",
+                        jail.display(&resolved)
+                    ));
+                }
             }
         }
+
         PermissionDecision::Allow
     }
 }
@@ -77,12 +127,18 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn normal_reads_are_allowed() {
+    fn normal_reads_are_allowed_in_build_mode() {
         let temp = tempfile::tempdir().expect("temp");
         std::fs::write(temp.path().join("src.rs"), "fn main() {}").expect("file");
         let jail = PathJail::new(temp.path()).expect("jail");
         assert_eq!(
-            PermissionGate.check("read", &json!({"path": "src.rs"}), &jail),
+            PermissionGate::new(PolicyMode::Build).check(
+                "read",
+                &json!({"path": "src.rs"}),
+                &jail,
+                false,
+                "read src.rs"
+            ),
             PermissionDecision::Allow
         );
     }
@@ -93,7 +149,49 @@ mod tests {
         std::fs::write(temp.path().join(".env"), "TOKEN=x").expect("file");
         let jail = PathJail::new(temp.path()).expect("jail");
         assert!(matches!(
-            PermissionGate.check("read", &json!({"path": ".env"}), &jail),
+            PermissionGate::new(PolicyMode::Build).check(
+                "read",
+                &json!({"path": ".env"}),
+                &jail,
+                false,
+                "read .env"
+            ),
+            PermissionDecision::Ask(_)
+        ));
+    }
+
+    #[test]
+    fn plan_mode_denies_mutations_and_build_mode_asks() {
+        let temp = tempfile::tempdir().expect("temp");
+        let jail = PathJail::new(temp.path()).expect("jail");
+        assert!(matches!(
+            PermissionGate::new(PolicyMode::Plan).check(
+                "write",
+                &json!({"path": "file.txt"}),
+                &jail,
+                true,
+                "write file.txt"
+            ),
+            PermissionDecision::Deny(_)
+        ));
+        assert!(matches!(
+            PermissionGate::new(PolicyMode::Build).check(
+                "write",
+                &json!({"path": "file.txt"}),
+                &jail,
+                true,
+                "write file.txt"
+            ),
+            PermissionDecision::Ask(_)
+        ));
+        assert!(matches!(
+            PermissionGate::new(PolicyMode::Build).check(
+                "bash",
+                &json!({"command": "ls"}),
+                &jail,
+                true,
+                "bash: ls"
+            ),
             PermissionDecision::Ask(_)
         ));
     }
@@ -106,15 +204,33 @@ mod tests {
         let jail = PathJail::new(temp.path()).expect("jail");
 
         assert!(matches!(
-            PermissionGate.check("read", &json!({"path": "/etc/passwd"}), &jail),
+            PermissionGate::new(PolicyMode::Build).check(
+                "read",
+                &json!({"path": "/etc/passwd"}),
+                &jail,
+                false,
+                "read"
+            ),
             PermissionDecision::Deny(_)
         ));
         assert!(matches!(
-            PermissionGate.check("read", &json!({"path": ".git/config"}), &jail),
+            PermissionGate::new(PolicyMode::Build).check(
+                "read",
+                &json!({"path": ".git/config"}),
+                &jail,
+                false,
+                "read"
+            ),
             PermissionDecision::Deny(_)
         ));
         assert!(matches!(
-            PermissionGate.check("bash", &json!({}), &jail),
+            PermissionGate::new(PolicyMode::Build).check(
+                "unknown",
+                &json!({}),
+                &jail,
+                false,
+                "unknown"
+            ),
             PermissionDecision::Deny(_)
         ));
     }

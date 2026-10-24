@@ -2,7 +2,7 @@
 //! approvals and cancellations.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -24,7 +24,9 @@ use thais_providers::{
     ChatEvent, ChatMessage, ChatRequest, Provider, ToolCall, ToolDefinition, Usage,
 };
 use thais_storage::{NewEvent, StorageError, StorageHandle};
-use thais_tools::{PermissionDecision, PermissionGate, ToolError, ToolRegistry, ToolResult};
+use thais_tools::{
+    PermissionDecision, PermissionGate, PolicyMode, ToolError, ToolRegistry, ToolResult,
+};
 use thiserror::Error;
 use tokio::sync::{Mutex, broadcast, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -33,6 +35,8 @@ use crate::clock::Clock;
 use crate::context::{ContextError, ContextManager, estimate_tokens};
 use crate::ids::IdGenerator;
 use crate::replay::{ReplayError, ReplayState};
+use crate::snapshot::{SnapshotError, SnapshotManager};
+use crate::verifier::{Verification, Verifier};
 
 const MAX_TOOL_ITERATIONS: usize = 8;
 const MAX_TURN_TOKENS: u64 = 50_000;
@@ -72,6 +76,9 @@ pub enum RuntimeError {
     /// Replay failure.
     #[error("replay error: {0}")]
     Replay(#[from] ReplayError),
+    /// Snapshot failure.
+    #[error("snapshot error: {0}")]
+    Snapshot(#[from] SnapshotError),
 }
 
 impl RuntimeError {
@@ -86,7 +93,8 @@ impl RuntimeError {
             | Self::Provider(_)
             | Self::Context(_)
             | Self::Tool(_)
-            | Self::Replay(_) => INTERNAL_ERROR,
+            | Self::Replay(_)
+            | Self::Snapshot(_) => INTERNAL_ERROR,
         };
         ErrorObject::new(code, self.to_string())
     }
@@ -131,6 +139,7 @@ struct SessionState {
     turn: Option<TurnState>,
     tools: Arc<ToolRegistry>,
     gate: PermissionGate,
+    snapshots: Arc<SnapshotManager>,
 }
 
 struct TurnState {
@@ -145,6 +154,8 @@ pub struct Runtime {
     clock: Arc<dyn Clock>,
     ids: Arc<dyn IdGenerator>,
     context: ContextManager,
+    snapshot_base: Option<PathBuf>,
+    verifier: Option<Arc<Verifier>>,
     sessions: Mutex<HashMap<String, SessionState>>,
     approvals: Mutex<HashMap<String, oneshot::Sender<ApprovalDecision>>>,
     events: broadcast::Sender<EventEnvelope>,
@@ -167,10 +178,26 @@ impl Runtime {
             clock,
             ids,
             context,
+            snapshot_base: None,
+            verifier: None,
             sessions: Mutex::new(HashMap::new()),
             approvals: Mutex::new(HashMap::new()),
             events,
         }
+    }
+
+    /// Store snapshots under the supplied base directory.
+    #[must_use]
+    pub fn with_snapshot_base(mut self, base: impl Into<PathBuf>) -> Self {
+        self.snapshot_base = Some(base.into());
+        self
+    }
+
+    /// Attach a verifier.
+    #[must_use]
+    pub fn with_verifier(mut self, verifier: Verifier) -> Self {
+        self.verifier = Some(Arc::new(verifier));
+        self
     }
 
     /// Subscribe to every live event emitted by this runtime.
@@ -216,13 +243,27 @@ impl Runtime {
         };
 
         self.storage.create_session(info.clone()).await?;
-        let tools = ToolRegistry::read_only(Path::new(&info.workspace))?;
+        let tools = match info.mode {
+            SessionMode::Plan => ToolRegistry::read_only(Path::new(&info.workspace))?,
+            SessionMode::Build => ToolRegistry::read_write(Path::new(&info.workspace))?,
+        };
+        let gate = PermissionGate::new(match info.mode {
+            SessionMode::Plan => PolicyMode::Plan,
+            SessionMode::Build => PolicyMode::Build,
+        });
+        let snapshot_root = self
+            .snapshot_base
+            .clone()
+            .unwrap_or_else(|| std::env::temp_dir().join("thais-snapshots"));
+        let snapshots =
+            SnapshotManager::new(Path::new(&info.workspace), &snapshot_root.join(&session_id))?;
         self.sessions.lock().await.insert(
             session_id.clone(),
             SessionState {
                 turn: None,
                 tools: Arc::new(tools),
-                gate: PermissionGate,
+                gate,
+                snapshots: Arc::new(snapshots),
             },
         );
         self.append_event(
@@ -273,12 +314,16 @@ impl Runtime {
             });
         }
 
-        let (tools, gate) = {
+        let (tools, gate, snapshots) = {
             let sessions = self.sessions.lock().await;
             let state = sessions
                 .get(session_id)
                 .ok_or_else(|| RuntimeError::SessionNotFound(session_id.to_owned()))?;
-            (Arc::clone(&state.tools), state.gate)
+            (
+                Arc::clone(&state.tools),
+                state.gate,
+                Arc::clone(&state.snapshots),
+            )
         };
 
         let runtime = Arc::clone(self);
@@ -286,7 +331,7 @@ impl Runtime {
         let turn = turn_id.clone();
         tokio::spawn(async move {
             runtime
-                .run_turn(session, turn, input, cancel, tools, gate)
+                .run_turn(session, turn, input, cancel, tools, gate, snapshots)
                 .await;
         });
         Ok(turn_id)
@@ -398,10 +443,20 @@ impl Runtime {
         task: String,
         model: Option<String>,
     ) -> Result<(SessionInfo, String, Vec<EventEnvelope>), RuntimeError> {
+        self.run_once_mode(workspace, task, model, SessionMode::Build)
+            .await
+    }
+
+    /// Run one turn in a specific mode.
+    pub async fn run_once_mode(
+        self: &Arc<Self>,
+        workspace: String,
+        task: String,
+        model: Option<String>,
+        mode: SessionMode,
+    ) -> Result<(SessionInfo, String, Vec<EventEnvelope>), RuntimeError> {
         let mut live = self.subscribe_live();
-        let session = self
-            .create_session(workspace, SessionMode::Build, model)
-            .await?;
+        let session = self.create_session(workspace, mode, model).await?;
         let turn_id = self.send(&session.session_id, task, None).await?;
 
         let mut events = Vec::new();
@@ -582,6 +637,7 @@ impl Runtime {
         Ok(event)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_turn(
         self: Arc<Self>,
         session_id: String,
@@ -590,9 +646,18 @@ impl Runtime {
         cancel: CancellationToken,
         tools: Arc<ToolRegistry>,
         gate: PermissionGate,
+        snapshots: Arc<SnapshotManager>,
     ) {
         if let Err(error) = self
-            .run_turn_inner(&session_id, &turn_id, &input, &cancel, tools, gate)
+            .run_turn_inner(
+                &session_id,
+                &turn_id,
+                &input,
+                &cancel,
+                tools,
+                gate,
+                snapshots,
+            )
             .await
         {
             let _ = self
@@ -615,6 +680,7 @@ impl Runtime {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_turn_inner(
         &self,
         session_id: &str,
@@ -623,6 +689,7 @@ impl Runtime {
         cancel: &CancellationToken,
         tools: Arc<ToolRegistry>,
         gate: PermissionGate,
+        snapshots: Arc<SnapshotManager>,
     ) -> Result<(), RuntimeError> {
         let session = self.storage.get_session(session_id.to_owned()).await?;
         let bundle = self
@@ -651,6 +718,7 @@ impl Runtime {
         ];
         let mut total_tokens = bundle.estimated_tokens as u64;
         let mut total_usage = Usage::default();
+        let mut repair_attempts = 0_u32;
         let started = tokio::time::Instant::now();
 
         for _ in 0..MAX_TOOL_ITERATIONS {
@@ -745,6 +813,22 @@ impl Runtime {
                 .saturating_add(usage.output_tokens);
 
             if accumulators.is_empty() {
+                if session.mode == SessionMode::Plan && !content.trim().is_empty() {
+                    let decision = self
+                        .request_approval(session_id, json!({"type": "plan", "plan": content}))
+                        .await?;
+                    if decision == ApprovalDecision::Allow {
+                        self.storage
+                            .update_session_mode(session_id.to_owned(), SessionMode::Build)
+                            .await?;
+                        let tools = ToolRegistry::read_write(Path::new(&session.workspace))?;
+                        let mut sessions = self.sessions.lock().await;
+                        if let Some(state) = sessions.get_mut(session_id) {
+                            state.tools = Arc::new(tools);
+                            state.gate = PermissionGate::new(PolicyMode::Build);
+                        }
+                    }
+                }
                 self.append_event(
                     session_id,
                     EventKind::TurnCompleted,
@@ -821,10 +905,27 @@ impl Runtime {
                         result: ToolResult {
                             content: format!("invalid JSON arguments: {error}"),
                             is_error: true,
+                            diff: None,
                         },
                     }),
-                    Ok(arguments) => match gate.check(&call.name, &arguments, tools.jail()) {
+                    Ok(arguments) => match gate.check(
+                        &call.name,
+                        &arguments,
+                        tools.jail(),
+                        tools.is_mutating(&call.name),
+                        &tools.summary(&call.name, &arguments),
+                    ) {
                         PermissionDecision::Allow => {
+                            self.append_event(
+                                session_id,
+                                EventKind::PermissionGranted,
+                                json!({
+                                    "turn_id": turn_id,
+                                    "tool": call.name.clone(),
+                                    "summary": tools.summary(&call.name, &arguments)
+                                }),
+                            )
+                            .await?;
                             prepared.push(PreparedTool::Execute { call, arguments });
                         }
                         PermissionDecision::Ask(reason) => {
@@ -834,7 +935,8 @@ impl Runtime {
                                     json!({
                                         "tool": call.name.clone(),
                                         "arguments": arguments.clone(),
-                                        "reason": reason
+                                        "reason": reason,
+                                        "diff": tools.preview(&call.name, &arguments)
                                     }),
                                 )
                                 .await?;
@@ -846,31 +948,50 @@ impl Runtime {
                                     result: ToolResult {
                                         content: "denied by user".to_owned(),
                                         is_error: true,
+                                        diff: None,
                                     },
                                 });
                             }
                         }
-                        PermissionDecision::Deny(reason) => prepared.push(PreparedTool::Result {
-                            call,
-                            result: ToolResult {
-                                content: format!("denied: {reason}"),
-                                is_error: true,
-                            },
-                        }),
+                        PermissionDecision::Deny(reason) => {
+                            self.append_event(
+                                session_id,
+                                EventKind::PermissionDenied,
+                                json!({
+                                    "turn_id": turn_id,
+                                    "tool": call.name.clone(),
+                                    "reason": reason.clone()
+                                }),
+                            )
+                            .await?;
+                            prepared.push(PreparedTool::Result {
+                                call,
+                                result: ToolResult {
+                                    content: format!("denied: {reason}"),
+                                    is_error: true,
+                                    diff: None,
+                                },
+                            });
+                        }
                     },
                 }
             }
 
             let mut tasks = Vec::new();
+            let mut mutating_calls = Vec::new();
             for (index, item) in prepared.iter().enumerate() {
                 if let PreparedTool::Execute { call, arguments } = item {
-                    let tools = Arc::clone(&tools);
-                    let name = call.name.clone();
-                    let args = arguments.clone();
-                    tasks.push((
-                        index,
-                        tokio::task::spawn_blocking(move || tools.execute(&name, args)),
-                    ));
+                    if tools.is_mutating(&call.name) {
+                        mutating_calls.push((index, call.clone(), arguments.clone()));
+                    } else {
+                        let tools = Arc::clone(&tools);
+                        let name = call.name.clone();
+                        let args = arguments.clone();
+                        tasks.push((
+                            index,
+                            tokio::task::spawn_blocking(move || tools.execute(&name, args)),
+                        ));
+                    }
                 }
             }
 
@@ -881,6 +1002,123 @@ impl Runtime {
                     Err(error) => Err(ToolError::InvalidArgs(format!("tool task failed: {error}"))),
                 };
                 executed.insert(index, result);
+            }
+
+            for (index, call, arguments) in mutating_calls {
+                let snapshot = match snapshots.create() {
+                    Ok(snapshot) => {
+                        self.append_event(
+                            session_id,
+                            EventKind::SnapshotCreated,
+                            json!({"turn_id": turn_id, "commit": snapshot.commit}),
+                        )
+                        .await?;
+                        snapshot
+                    }
+                    Err(error) => {
+                        executed.insert(
+                            index,
+                            Err(ToolError::Command(format!("snapshot failed: {error}"))),
+                        );
+                        continue;
+                    }
+                };
+
+                let result = tools.execute(&call.name, arguments);
+                if cancel.is_cancelled() {
+                    let restored = snapshots.restore(&snapshot).unwrap_or_default();
+                    self.append_event(
+                        session_id,
+                        EventKind::RollbackCompleted,
+                        json!({"turn_id": turn_id, "paths": restored}),
+                    )
+                    .await?;
+                    self.append_event(
+                        session_id,
+                        EventKind::TurnCancelled,
+                        json!({"turn_id": turn_id}),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                match result {
+                    Ok(mut result) => {
+                        if let Some(verifier) = &self.verifier {
+                            self.append_event(
+                                session_id,
+                                EventKind::VerificationStarted,
+                                json!({"turn_id": turn_id, "commands": verifier.commands()}),
+                            )
+                            .await?;
+                            match verifier.run(tools.jail().root()) {
+                                Verification::Pass => {
+                                    self.append_event(
+                                        session_id,
+                                        EventKind::VerificationPassed,
+                                        json!({"turn_id": turn_id}),
+                                    )
+                                    .await?;
+                                    executed.insert(index, Ok(result));
+                                }
+                                Verification::Fail { output } => {
+                                    let output = truncate_output(&output);
+                                    self.append_event(
+                                        session_id,
+                                        EventKind::VerificationFailed,
+                                        json!({"turn_id": turn_id, "output": output}),
+                                    )
+                                    .await?;
+                                    let restored = snapshots.restore(&snapshot).unwrap_or_default();
+                                    self.append_event(
+                                        session_id,
+                                        EventKind::RollbackCompleted,
+                                        json!({"turn_id": turn_id, "paths": restored}),
+                                    )
+                                    .await?;
+                                    repair_attempts += 1;
+                                    executed.insert(
+                                        index,
+                                        Ok(ToolResult {
+                                            content: format!(
+                                                "verification failed; changes rolled back. output:\n{output}"
+                                            ),
+                                            is_error: true,
+                                            diff: None,
+                                        }),
+                                    );
+                                    if repair_attempts >= 2 {
+                                        return Err(RuntimeError::InvalidRequest(
+                                            "repair budget exhausted".to_owned(),
+                                        ));
+                                    }
+                                }
+                                Verification::Unavailable { reason } => {
+                                    self.append_event(
+                                        session_id,
+                                        EventKind::VerificationUnavailable,
+                                        json!({"turn_id": turn_id, "reason": reason}),
+                                    )
+                                    .await?;
+                                    result.content =
+                                        format!("{}\n[unverified: {reason}]", result.content);
+                                    executed.insert(index, Ok(result));
+                                }
+                            }
+                        } else {
+                            executed.insert(index, Ok(result));
+                        }
+                    }
+                    Err(error) => {
+                        let restored = snapshots.restore(&snapshot).unwrap_or_default();
+                        self.append_event(
+                            session_id,
+                            EventKind::RollbackCompleted,
+                            json!({"turn_id": turn_id, "paths": restored}),
+                        )
+                        .await?;
+                        executed.insert(index, Err(error));
+                    }
+                }
             }
 
             if cancel.is_cancelled() {
@@ -905,6 +1143,7 @@ impl Runtime {
                             Err(error) => ToolResult {
                                 content: error.to_string(),
                                 is_error: true,
+                                diff: None,
                             },
                         };
                         (call, result)
@@ -922,7 +1161,8 @@ impl Runtime {
                         "tool_call_id": call.id,
                         "name": call.name,
                         "content": result.content,
-                        "is_error": result.is_error
+                        "is_error": result.is_error,
+                        "diff": result.diff
                     }),
                 )
                 .await?;
@@ -952,4 +1192,13 @@ struct ToolAccumulator {
 enum PreparedTool {
     Execute { call: ToolCall, arguments: Value },
     Result { call: ToolCall, result: ToolResult },
+}
+
+fn truncate_output(text: &str) -> String {
+    const MAX: usize = 4_000;
+    if text.chars().count() <= MAX {
+        text.to_owned()
+    } else {
+        format!("{}…", text.chars().take(MAX).collect::<String>())
+    }
 }

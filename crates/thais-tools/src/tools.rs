@@ -1,4 +1,4 @@
-//! Read-only tools: read, list, glob, and grep.
+//! Read and mutate tools exposed to the model.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -9,7 +9,10 @@ use ignore::WalkBuilder;
 use regex::Regex;
 use serde_json::{Value, json};
 
+use crate::bash::BashTool;
 use crate::error::ToolError;
+use crate::git::{GitDiffTool, GitStatusTool};
+use crate::mutating::{ApplyPatchTool, EditTool, WriteTool};
 use crate::path_jail::PathJail;
 
 const MAX_READ_BYTES: u64 = 2_000_000;
@@ -36,18 +39,29 @@ pub struct ToolResult {
     pub content: String,
     /// Whether the result represents an error.
     pub is_error: bool,
+    /// Optional unified diff for a mutation.
+    pub diff: Option<String>,
 }
 
 impl ToolResult {
-    fn ok(content: impl Into<String>) -> Self {
+    pub(crate) fn ok(content: impl Into<String>) -> Self {
         Self {
             content: content.into(),
             is_error: false,
+            diff: None,
+        }
+    }
+
+    pub(crate) fn ok_with_diff(content: impl Into<String>, diff: impl Into<String>) -> Self {
+        Self {
+            content: content.into(),
+            is_error: false,
+            diff: Some(diff.into()),
         }
     }
 }
 
-/// A read-only tool. Tools do synchronous file I/O and are executed on a
+/// A tool exposed to the model. Tools do synchronous I/O and are executed on a
 /// blocking pool by the runtime.
 pub trait Tool: Send + Sync {
     /// Tool definition.
@@ -55,9 +69,30 @@ pub trait Tool: Send + Sync {
 
     /// Execute the tool.
     fn execute(&self, args: Value, jail: &PathJail) -> Result<ToolResult, ToolError>;
+
+    /// Whether the tool may change the workspace.
+    fn mutating(&self) -> bool {
+        false
+    }
+
+    /// Short action summary used by approval prompts.
+    fn summary(&self, args: &Value) -> String {
+        let name = self.definition().name;
+        let path = args.get("path").and_then(Value::as_str).unwrap_or("");
+        if path.is_empty() {
+            name
+        } else {
+            format!("{name} {path}")
+        }
+    }
+
+    /// Preview the effect of a mutation without applying it.
+    fn preview(&self, _args: &Value, _jail: &PathJail) -> Option<String> {
+        None
+    }
 }
 
-/// Registry of the four M1 read-only tools.
+/// Registry of M1 read-only tools and M2 mutation tools.
 pub struct ToolRegistry {
     jail: PathJail,
     tools: HashMap<String, Arc<dyn Tool>>,
@@ -72,7 +107,23 @@ impl ToolRegistry {
         tools.insert("list".to_owned(), Arc::new(ListTool));
         tools.insert("glob".to_owned(), Arc::new(GlobTool));
         tools.insert("grep".to_owned(), Arc::new(GrepTool));
+        tools.insert("git_status".to_owned(), Arc::new(GitStatusTool));
+        tools.insert("git_diff".to_owned(), Arc::new(GitDiffTool));
         Ok(Self { jail, tools })
+    }
+
+    /// Build the full M2 registry for a workspace.
+    pub fn read_write(root: &Path) -> Result<Self, ToolError> {
+        let mut registry = Self::read_only(root)?;
+        registry.tools.insert("edit".to_owned(), Arc::new(EditTool));
+        registry
+            .tools
+            .insert("write".to_owned(), Arc::new(WriteTool));
+        registry
+            .tools
+            .insert("apply_patch".to_owned(), Arc::new(ApplyPatchTool));
+        registry.tools.insert("bash".to_owned(), Arc::new(BashTool));
+        Ok(registry)
     }
 
     /// Definitions in stable name order.
@@ -94,6 +145,28 @@ impl ToolRegistry {
             .get(name)
             .ok_or_else(|| ToolError::UnknownTool(name.to_owned()))?;
         tool.execute(args, &self.jail)
+    }
+
+    /// Whether a tool may mutate the workspace.
+    #[must_use]
+    pub fn is_mutating(&self, name: &str) -> bool {
+        self.tools.get(name).is_some_and(|tool| tool.mutating())
+    }
+
+    /// Human-readable action summary for approvals.
+    #[must_use]
+    pub fn summary(&self, name: &str, args: &Value) -> String {
+        self.tools
+            .get(name)
+            .map_or_else(|| name.to_owned(), |tool| tool.summary(args))
+    }
+
+    /// Preview a mutation without applying it.
+    #[must_use]
+    pub fn preview(&self, name: &str, args: &Value) -> Option<String> {
+        self.tools
+            .get(name)
+            .and_then(|tool| tool.preview(args, &self.jail))
     }
 
     /// Workspace jail.
@@ -394,7 +467,7 @@ fn walk(base: &Path) -> impl Iterator<Item = Result<ignore::DirEntry, ignore::Er
         .build()
 }
 
-fn metadata(path: &Path) -> Result<std::fs::Metadata, ToolError> {
+pub(crate) fn metadata(path: &Path) -> Result<std::fs::Metadata, ToolError> {
     std::fs::metadata(path).map_err(|source| {
         if source.kind() == std::io::ErrorKind::NotFound {
             ToolError::NotFound(path.to_path_buf())
@@ -407,14 +480,14 @@ fn metadata(path: &Path) -> Result<std::fs::Metadata, ToolError> {
     })
 }
 
-fn required_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, ToolError> {
+pub(crate) fn required_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, ToolError> {
     args.get(key)
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| ToolError::InvalidArgs(format!("missing `{key}`")))
 }
 
-fn cap_output(mut output: String) -> String {
+pub(crate) fn cap_output(mut output: String) -> String {
     if output.chars().count() > MAX_OUTPUT_CHARS {
         output = output.chars().take(MAX_OUTPUT_CHARS).collect();
         output.push_str("\n[truncated]");
@@ -494,6 +567,9 @@ mod tests {
             .into_iter()
             .map(|definition| definition.name)
             .collect();
-        assert_eq!(names, vec!["glob", "grep", "list", "read"]);
+        assert_eq!(
+            names,
+            vec!["git_diff", "git_status", "glob", "grep", "list", "read"]
+        );
     }
 }

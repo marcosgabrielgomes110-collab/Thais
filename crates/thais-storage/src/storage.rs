@@ -229,6 +229,22 @@ impl Storage {
         Ok(count > 0)
     }
 
+    /// Update the active mode of a session.
+    pub fn update_session_mode(
+        &self,
+        session_id: &str,
+        mode: SessionMode,
+    ) -> Result<(), StorageError> {
+        let updated = self.conn.execute(
+            "UPDATE sessions SET mode = ?1, updated_at = ?2 WHERE session_id = ?3",
+            params![mode.as_str(), Utc::now().to_rfc3339(), session_id],
+        )?;
+        if updated == 0 {
+            return Err(StorageError::SessionNotFound(session_id.to_owned()));
+        }
+        Ok(())
+    }
+
     /// Append one event and return it with its assigned sequence number.
     pub fn append_event(&mut self, event: NewEvent) -> Result<EventEnvelope, StorageError> {
         let NewEvent {
@@ -487,6 +503,16 @@ impl StorageHandle {
     /// List sessions.
     pub async fn list_sessions(&self) -> Result<Vec<SessionInfo>, StorageError> {
         self.with(|storage| storage.list_sessions()).await
+    }
+
+    /// Update the active mode of a session.
+    pub async fn update_session_mode(
+        &self,
+        session_id: String,
+        mode: SessionMode,
+    ) -> Result<(), StorageError> {
+        self.with(move |storage| storage.update_session_mode(&session_id, mode))
+            .await
     }
 
     /// Append one event.

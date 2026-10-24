@@ -35,6 +35,7 @@ pub async fn run<T: Transport + 'static>(
     client: Client<T>,
     workspace: String,
     model: Option<String>,
+    mode: SessionMode,
 ) -> Result<()> {
     let mut notifications = client.notifications();
     client
@@ -49,7 +50,7 @@ pub async fn run<T: Transport + 'static>(
     let created = client
         .session_create(SessionCreateParams {
             workspace,
-            mode: SessionMode::Build,
+            mode,
             model,
         })
         .await
@@ -82,6 +83,7 @@ pub async fn run<T: Transport + 'static>(
 struct PendingApproval {
     approval_id: String,
     action: String,
+    diff: Option<String>,
 }
 
 struct AppState {
@@ -184,6 +186,14 @@ impl AppState {
                     if is_error { "error" } else { "result" },
                     truncate(content, 500)
                 ));
+                if let Some(diff) = event
+                    .payload
+                    .get("diff")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    self.transcript
+                        .push_str(&format!("[diff]\n{}\n", truncate(diff, 1200)));
+                }
                 self.status = "tool result".to_owned();
             }
             EventKind::PermissionRequested => {
@@ -199,11 +209,31 @@ impl AppState {
                     .cloned()
                     .unwrap_or_default()
                     .to_string();
+                let diff = event
+                    .payload
+                    .get("action")
+                    .and_then(|action| action.get("diff"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToOwned::to_owned);
                 self.pending = Some(PendingApproval {
                     approval_id,
                     action,
+                    diff,
                 });
                 self.status = "approval required (y/n)".to_owned();
+            }
+            EventKind::PermissionGranted => {
+                self.status = "permission granted".to_owned();
+            }
+            EventKind::PermissionDenied => {
+                let reason = event
+                    .payload
+                    .get("reason")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("denied");
+                self.transcript
+                    .push_str(&format!("\n[permission denied] {reason}\n"));
+                self.status = "permission denied".to_owned();
             }
             EventKind::PermissionResolved => {
                 self.pending = None;
@@ -228,6 +258,34 @@ impl AppState {
                     .unwrap_or("unknown error");
                 self.transcript.push_str(&format!("\n[error] {message}\n"));
                 self.status = "error".to_owned();
+            }
+            EventKind::SnapshotCreated => {
+                self.status = "snapshot created".to_owned();
+            }
+            EventKind::RollbackCompleted => {
+                self.transcript.push_str("\n[rollback completed]\n");
+                self.status = "rolled back".to_owned();
+            }
+            EventKind::VerificationStarted => {
+                self.status = "verifying".to_owned();
+            }
+            EventKind::VerificationPassed => {
+                self.status = "verified".to_owned();
+            }
+            EventKind::VerificationFailed => {
+                let output = event
+                    .payload
+                    .get("output")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                self.transcript.push_str(&format!(
+                    "\n[verification failed]\n{}\n",
+                    truncate(output, 800)
+                ));
+                self.status = "verification failed".to_owned();
+            }
+            EventKind::VerificationUnavailable => {
+                self.status = "unverified".to_owned();
             }
             EventKind::SessionCreated | EventKind::TurnStarted => {}
         }
@@ -417,8 +475,13 @@ fn draw_ui(frame: &mut Frame<'_>, app: &AppState) {
         frame.render_widget(Clear, area);
         let text = format!(
             "Approval required\n\n{}\n\n[y] allow    [n] deny",
-            truncate(&pending.action, 800)
+            truncate(&pending.action, 600)
         );
+        let text = if let Some(diff) = &pending.diff {
+            format!("{text}\n\n{}", truncate(diff, 2000))
+        } else {
+            text
+        };
         let modal = Paragraph::new(text)
             .block(Block::default().borders(Borders::ALL).title("Permission"))
             .wrap(Wrap { trim: false });
@@ -551,6 +614,52 @@ mod tests {
         app.apply_notification(notification);
         assert_eq!(app.transcript, "hello");
         assert!(app.streaming);
+    }
+
+    #[test]
+    fn permission_request_opens_a_diff_modal() {
+        let mut app = AppState::new(session());
+        let session_id = app.session_id.clone();
+        let notification = Notification::new(
+            method::SESSION_EVENT,
+            json!({
+                "event": {
+                    "event_id": "e2",
+                    "session_id": session_id,
+                    "seq": 2,
+                    "timestamp": "2026-10-23T00:00:00Z",
+                    "kind": "permission_requested",
+                    "payload": {
+                        "approval_id": "approval_1",
+                        "action": {
+                            "tool": "write",
+                            "diff": "+hello\n"
+                        }
+                    }
+                }
+            }),
+        );
+        app.apply_notification(notification);
+        assert!(app.pending.is_some());
+        assert_eq!(
+            app.pending
+                .as_ref()
+                .and_then(|pending| pending.diff.as_deref()),
+            Some("+hello\n")
+        );
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal.draw(|frame| draw_ui(frame, &app)).expect("draw");
+        let content = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(content.contains("Approval required"));
+        assert!(content.contains("+hello"));
     }
 
     #[test]

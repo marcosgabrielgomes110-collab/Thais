@@ -1,6 +1,7 @@
 //! Path confinement for read-only tools.
 
-use std::path::{Path, PathBuf};
+use std::ffi::OsString;
+use std::path::{Component, Path, PathBuf};
 
 use crate::error::ToolError;
 
@@ -33,6 +34,12 @@ impl PathJail {
             self.canonical_root.clone()
         } else {
             let path = Path::new(requested);
+            if path
+                .components()
+                .any(|component| matches!(component, Component::ParentDir))
+            {
+                return Err(ToolError::Escape(path.to_path_buf()));
+            }
             if path.is_absolute() {
                 path.to_path_buf()
             } else {
@@ -46,17 +53,29 @@ impl PathJail {
                 source,
             })?
         } else {
-            let parent = path.parent().ok_or_else(|| {
-                ToolError::InvalidArgs(format!("path has no parent: {}", path.display()))
-            })?;
-            let parent = std::fs::canonicalize(parent).map_err(|source| ToolError::Io {
-                path: parent.to_path_buf(),
-                source,
-            })?;
-            let name = path.file_name().ok_or_else(|| {
-                ToolError::InvalidArgs(format!("path has no file name: {}", path.display()))
-            })?;
-            parent.join(name)
+            let mut ancestor = path.as_path();
+            let mut suffix: Vec<OsString> = Vec::new();
+            while !ancestor.exists() {
+                let name = ancestor.file_name().ok_or_else(|| {
+                    ToolError::InvalidArgs(format!("path has no file name: {}", path.display()))
+                })?;
+                suffix.push(name.to_os_string());
+                ancestor = ancestor.parent().ok_or_else(|| {
+                    ToolError::InvalidArgs(format!(
+                        "path has no existing ancestor: {}",
+                        path.display()
+                    ))
+                })?;
+            }
+            let mut canonical =
+                std::fs::canonicalize(ancestor).map_err(|source| ToolError::Io {
+                    path: ancestor.to_path_buf(),
+                    source,
+                })?;
+            for name in suffix.iter().rev() {
+                canonical.push(name);
+            }
+            canonical
         };
 
         if !canonical.starts_with(&self.canonical_root) {

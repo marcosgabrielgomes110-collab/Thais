@@ -8,10 +8,11 @@ ARGS ?=
 TARGET ?= target/release/$(BIN)
 DIST_DIR ?= dist
 PROVIDER ?= $(if $(filter cohere,$(MAKECMDGOALS)),cohere,fake)
+MODE ?= build
 MODEL ?=
 WORKSPACE ?=
 
-TUI_ARGS := --provider $(PROVIDER)
+TUI_ARGS := --provider $(PROVIDER) --mode "$(MODE)"
 ifneq ($(MODEL),)
 TUI_ARGS += --model "$(MODEL)"
 endif
@@ -115,9 +116,10 @@ help:
 		'  make boundary     fail if thais-tui depends on thais-core' \
 		'  make build        release build' \
 		'  make run          run with ARGS="..."' \
-		'  make tui          run the TUI (PROVIDER=fake by default)' \
+		'  make tui          run the TUI (PROVIDER=fake, MODE=build by default)' \
 		'  make tui PROVIDER=cohere   run the TUI with Cohere' \
 		'  make tui cohere            shorthand for the same' \
+		'  make tui cohere MODE=plan  start in plan mode' \
 		'  make tui PROVIDER=cohere MODEL=command-a-plus-05-2026 WORKSPACE=.' \
 		'  make install      install to $(BINDIR)' \
 		'  make uninstall    remove the installed binary' \

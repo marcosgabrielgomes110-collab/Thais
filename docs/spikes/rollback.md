@@ -130,6 +130,14 @@ Do not claim complete rollback. The following remain outside the guarantee:
 - changes made by another process during snapshot or restore;
 - storage exhaustion or a snapshot that fails before the action starts.
 
+## M2 implementation note
+
+The initial M2 implementation uses shadow Git with `git add -A`, which honors
+the project's `.gitignore`. Changes made by bash to ignored files are therefore
+not captured in the first cut. This is an explicit best-effort limitation;
+force-add with file/byte caps is the follow-up once the large-repository
+benchmark is repeated.
+
 ## M2 acceptance tests for the chosen implementation
 
 1. Create, modify, delete, and rename a text file; restore the exact pre-state.

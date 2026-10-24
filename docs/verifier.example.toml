@@ -1,0 +1,8 @@
+# Example verifier configuration.
+# Copy this file to ~/.config/thais/verifier.toml.
+# Project config cannot supply verifier commands.
+commands = [
+  "cargo test",
+  "cargo clippy --workspace --all-targets --all-features -- -D warnings",
+]
+timeout_secs = 120

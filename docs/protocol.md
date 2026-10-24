@@ -88,20 +88,28 @@ Event kinds in v1:
 | Kind | Payload |
 |---|---|
 | `session_created` | `session` |
+| `snapshot_created` | `turn_id`, `commit` |
+| `rollback_completed` | `turn_id`, `paths` |
+| `verification_started` | `turn_id`, `commands` |
+| `verification_passed` | `turn_id` |
+| `verification_failed` | `turn_id`, `output` |
+| `verification_unavailable` | `turn_id`, `reason` |
 | `turn_started` | `turn_id`, `input` |
 | `model_delta` | `turn_id`, `text` |
 | `reasoning_delta` | `turn_id`, `text` |
 | `tool_call` | `turn_id`, `id`, `name`, `arguments` |
-| `tool_result` | `turn_id`, `tool_call_id`, `name`, `content`, `is_error` |
+| `tool_result` | `turn_id`, `tool_call_id`, `name`, `content`, `is_error`, `diff` |
 | `permission_requested` | `approval_id`, `action` |
+| `permission_granted` | `turn_id`, `tool`, `summary` |
+| `permission_denied` | `turn_id`, `tool`, `reason` |
 | `permission_resolved` | `approval_id`, `decision` |
 | `turn_completed` | `turn_id`, `usage.input_tokens`, `usage.output_tokens` |
 | `turn_cancelled` | `turn_id` |
 | `error` | `turn_id`, `message` |
 
 M0 emits the session, turn, model, reasoning, approval, completion, cancellation,
-and error events. Tool events are defined now; real tool execution arrives in
-M1 and M2.
+and error events. M1 adds read tools. M2 adds snapshots, rollback, verification,
+write/edit/patch, bash, and git read tools.
 
 ## Errors
 
@@ -114,6 +122,24 @@ M1 and M2.
 | `-32603` | Internal error, storage failure, provider failure |
 
 Responses carry exactly one of `result` or `error`.
+
+## M2 build flow
+
+- `session.create` with `mode: "plan"` exposes read-only tools only. The gate
+  denies mutations in plan mode.
+- When a plan turn completes, the runtime emits `permission_requested` with an
+  action of type `plan`. Approving it with `session.approve` switches the
+  session to build mode; rejecting it keeps the session in plan mode.
+- In build mode, `write`, `edit`, and `apply_patch` require approval. `bash`
+  always requires approval until M6.
+- Before every mutating action, the runtime writes a shadow-Git snapshot and
+  emits `snapshot_created`.
+- After a successful mutation, the configured verifier runs. A failure emits
+  `verification_failed`, restores the snapshot, emits `rollback_completed`, and
+  returns the failure to the model for a bounded repair attempt.
+- `tool_result` includes the unified `diff` for mutations, so clients can show
+  the change before and after approval.
+- `git_status` and `git_diff` are read-only tools.
 
 ## Security and trust
 
