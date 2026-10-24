@@ -12,6 +12,7 @@
 The runtime auto-detects a Linux backend:
 
 - `bwrap` (bubblewrap) with `--unshare-all`, read-only root, writable workspace, private `/proc` and `/dev`, and no network.
+- If `bwrap` is unavailable, the `thais-sandbox` helper applies Landlock filesystem rules (read-only root, read-write workspace) and denies TCP connect/bind.
 
 `THAIS_SANDBOX` controls behavior:
 
@@ -24,8 +25,9 @@ The runtime auto-detects a Linux backend:
 ## Known residual risks
 
 - Linux without `bwrap`: no OS sandbox; `bash` is still gated but can read/write outside the workspace and reach the network.
-- The current sandbox is namespace-based, not a complete Landlock/seccomp profile.
+- The Linux sandbox uses namespaces and/or Landlock; seccomp syscall filtering is not included yet.
 - macOS Seatbelt and Windows Job Objects are deferred to the stable release; macOS tests run the fallback path.
+- Landlock is not available on kernels older than 5.13; fallback remains unsandboxed but gated.
 - Shell commands may spawn descendants; process-group cleanup is best-effort after timeout/cancel.
 - Snapshots honor `.gitignore`; ignored files and bash changes are best-effort.
 - Tool output is redacted before it reaches the model and Event Log, but a secret that matches no pattern can still pass.

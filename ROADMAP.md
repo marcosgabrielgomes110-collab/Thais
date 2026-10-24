@@ -731,12 +731,13 @@ servers must already be installed by the user.
 - Protocol fuzzing and concurrency tests pass.
 - Sandbox escape tests document residual risk.
 
-**Implementation notes:** The current branch has best-effort sandbox detection
-(`bwrap` on Linux, `sandbox-exec` on macOS; `THAIS_SANDBOX=auto|off|required`),
-runtime redaction of tool output and diffs, expanded secret patterns, and tests.
-Still missing: Landlock/seccomp, Windows Job Objects, PTY/ConPTY, Windows test
-matrix, fuzzing, full prompt-injection coverage, idempotent crash recovery, and
-the performance pass.
+**Implementation notes:** The Linux preview has `bwrap` namespace sandboxing
+with a Landlock helper fallback (`thais-sandbox`) that restricts filesystem
+access and denies TCP, `THAIS_SANDBOX=auto|off|required`, tool-output redaction,
+expanded secret patterns, prompt-injection tests, lease-expiry recovery, and a
+bounded TUI transcript. Still missing for stable: seccomp syscall filtering,
+Seatbelt, Windows Job Objects, PTY/ConPTY, Windows tests, fuzzing/loom,
+environment-leak coverage, end-to-end crash recovery, and the performance pass.
 
 **Out of scope:** Formal verification, multi-user authentication, cloud isolation.
 

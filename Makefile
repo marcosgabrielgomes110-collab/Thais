@@ -81,10 +81,11 @@ fake cohere:
 install: build
 	mkdir -p "$(BINDIR)"
 	install -m 0755 "$(TARGET)" "$(BINDIR)/$(BIN)"
+	@if [ -x target/release/thais-sandbox ]; then install -m 0755 target/release/thais-sandbox "$(BINDIR)/thais-sandbox"; fi
 	@echo "installed $(BINDIR)/$(BIN)"
 
 uninstall:
-	rm -f "$(BINDIR)/$(BIN)"
+	rm -f "$(BINDIR)/$(BIN)" "$(BINDIR)/thais-sandbox"
 	@echo "removed $(BINDIR)/$(BIN); config, credentials, sessions, and memory were preserved"
 
 clean:

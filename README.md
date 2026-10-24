@@ -273,33 +273,35 @@ thais lease release --workspace .
 | M4 — Memory and continuity | Done | `v0.5.0-m4` |
 | M5 — Tool ecosystem | Done | `v0.6.0-m5` |
 | Alpha | Feedback gate | em uso real |
-| M6 — Hardening | Em andamento | sandbox, PTY, cross-platform |
+| M6 — Hardening | Linux preview | sandbox Linux, PTY/cross-platform no stable |
 
 O Alpha continua sendo o gate de feedback em repositório real. O **M6** está
 em andamento: a primeira camada já está no `main`, mas o marco ainda não foi
 fechado.
 
-### M6 hardening — em andamento
+### M6 hardening — Linux preview
 
 Já implementado:
 
-- Detecção automática de sandbox de processo:
-  - Linux: `bwrap` (bubblewrap), com `--unshare-all`
-  - macOS: `sandbox-exec`
-  - fallback para execução não isolada, mantendo `bash` em `ask`
-- `THAIS_SANDBOX=auto|off|required`; `required` recusa executar sem backend.
-- Status do backend no `thais doctor`.
-- Redaction de tool output e diffs antes de irem para o modelo e para o Event Log.
-- Expansão dos padrões de segredo no redactor.
-- Testes de redaction de tool output e de fallback de sandbox.
+- Sandbox Linux:
+  - `bwrap` com namespaces quando disponível;
+  - fallback Landlock via `thais-sandbox`, com filesystem restrito e rede bloqueada;
+  - `THAIS_SANDBOX=auto|off|required`;
+  - fallback seguro mantendo `bash` em `ask`;
+  - status do backend no `thais doctor`.
+- `thais-sandbox` é instalado junto com o binário e aplica Landlock antes do `exec`.
+- Redaction de tool output e diffs antes do modelo e do Event Log.
+- Expansão dos padrões de segredo.
+- Testes de prompt injection, redaction e recuperação de lease expirado.
+- TUI limita o transcript renderizado para evitar crescimento sem limite.
 
-Ainda falta para fechar o M6:
+Ainda falta para o stable cross-platform:
 
-- Landlock/seccomp no Linux, Seatbelt completo no macOS e Job Objects no Windows.
-- PTY/ConPTY com `portable-pty`.
-- Matriz de testes Windows, fuzzing de protocolo e testes de concorrência.
-- Testes completos de prompt injection e vazamento de ambiente.
-- Recuperação de crash com retries idempotentes.
+- Seatbelt nativo no macOS e Job Objects no Windows.
+- PTY/ConPTY nativo.
+- Matriz de testes Windows, fuzzing de protocolo e testes com `loom`.
+- Cobertura completa de environment leakage.
+- Retries idempotentes de mutações e recuperação de crash fim a fim.
 - Pass de performance de contexto, SQLite, eventos e TUI.
 
 ## Documentação

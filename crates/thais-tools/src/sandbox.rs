@@ -21,6 +21,8 @@ pub enum SandboxBackend {
     Bubblewrap(PathBuf),
     /// macOS sandbox-exec.
     SandboxExec(PathBuf),
+    /// Linux Landlock helper.
+    Landlock(PathBuf),
     /// No backend is available.
     None,
 }
@@ -110,6 +112,17 @@ impl Sandbox {
                     .arg(shell_command);
                 Ok(command)
             }
+            SandboxBackend::Landlock(path) => {
+                let mut command = Command::new(path);
+                command
+                    .arg("--workspace")
+                    .arg(workspace)
+                    .arg("--cwd")
+                    .arg(cwd)
+                    .arg("--")
+                    .arg(shell_command);
+                Ok(command)
+            }
             SandboxBackend::SandboxExec(path) => {
                 let profile = format!(
                     "(version 1)\n(allow default)\n(deny network*)\n(allow file-read*)\n(allow file-write* (subpath \"{}\"))\n",
@@ -150,6 +163,9 @@ fn detect_backend() -> SandboxBackend {
         if let Some(path) = which_path("bwrap") {
             return SandboxBackend::Bubblewrap(path);
         }
+        if let Some(path) = helper_path() {
+            return SandboxBackend::Landlock(path);
+        }
     }
     #[cfg(target_os = "macos")]
     {
@@ -158,6 +174,24 @@ fn detect_backend() -> SandboxBackend {
         }
     }
     SandboxBackend::None
+}
+
+fn helper_path() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("THAIS_SANDBOX_HELPER") {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    if let Ok(current) = std::env::current_exe()
+        && let Some(parent) = current.parent()
+    {
+        let sibling = parent.join("thais-sandbox");
+        if sibling.is_file() {
+            return Some(sibling);
+        }
+    }
+    which_path("thais-sandbox")
 }
 
 fn which_path(name: &str) -> Option<PathBuf> {

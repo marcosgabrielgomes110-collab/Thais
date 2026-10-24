@@ -9,6 +9,7 @@ members = [
     "crates/thais-core",
     "crates/thais-tui",
     "crates/thais-cli",
+    "crates/thais-sandbox",
     "test/e2e",
 ]
 

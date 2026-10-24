@@ -1895,3 +1895,28 @@ async fn tool_output_is_redacted_before_the_model_and_event_log() {
     assert!(!encoded.contains("sk-live-secret-123"), "{encoded}");
     assert!(encoded.contains("[REDACTED]"));
 }
+
+#[tokio::test]
+async fn expired_lease_allows_recovery_after_a_crash() {
+    let temp = tempfile::tempdir().expect("temp");
+    let first = runtime(&temp, script(vec![]));
+    let workspace = temp.path().to_string_lossy().into_owned();
+    let session = first
+        .create_session(workspace.clone(), SessionMode::Build, None)
+        .await
+        .expect("first");
+    // Simulate a crashed owner by expiring its lease, then let another
+    // runtime recover the workspace.
+    let storage =
+        thais_storage::StorageHandle::open(temp.path().join("thais.db")).expect("storage");
+    storage
+        .acquire_lease(workspace.clone(), session.session_id.clone(), 0, true)
+        .await
+        .expect("expire");
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let second = runtime_with_prefix(&temp, script(vec![]), "z");
+    second
+        .create_session(workspace, SessionMode::Build, None)
+        .await
+        .expect("recovery");
+}

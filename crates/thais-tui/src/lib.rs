@@ -32,6 +32,8 @@ use thais_protocol::session::{
 use thais_sdk::{Client, Transport};
 use tokio::sync::mpsc;
 
+const MAX_RENDERED_LINES: usize = 4_000;
+
 /// Start the TUI against a connected client.
 pub async fn run<T: Transport + 'static>(
     client: Client<T>,
@@ -660,7 +662,10 @@ fn draw_ui(frame: &mut Frame<'_>, app: &AppState) {
         ])
         .split(area);
 
-    let lines = markdown_lines(&app.transcript);
+    let mut lines = markdown_lines(&app.transcript);
+    if lines.len() > MAX_RENDERED_LINES {
+        lines = lines.split_off(lines.len() - MAX_RENDERED_LINES);
+    }
     let transcript_height = chunks[0].height.saturating_sub(2) as usize;
     let max_scroll = lines.len().saturating_sub(transcript_height) as u16;
     let scroll = if app.auto_scroll {
