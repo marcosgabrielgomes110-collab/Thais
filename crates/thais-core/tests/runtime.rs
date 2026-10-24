@@ -1910,10 +1910,10 @@ async fn expired_lease_allows_recovery_after_a_crash() {
     let storage =
         thais_storage::StorageHandle::open(temp.path().join("thais.db")).expect("storage");
     storage
-        .acquire_lease(workspace.clone(), session.session_id.clone(), 0, true)
+        .acquire_lease(workspace.clone(), session.session_id.clone(), 1, true)
         .await
         .expect("expire");
-    tokio::time::sleep(Duration::from_millis(5)).await;
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
     let second = runtime_with_prefix(&temp, script(vec![]), "z");
     second
         .create_session(workspace, SessionMode::Build, None)
