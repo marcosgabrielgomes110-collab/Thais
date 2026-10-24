@@ -344,3 +344,22 @@ fn history_command_searches_the_event_log() {
     assert!(stdout.contains("\"kind\":\"turn_started\""), "{stdout}");
     assert!(stdout.contains("session_name"), "{stdout}");
 }
+
+#[test]
+fn events_command_prints_the_event_log() {
+    let temp = tempfile::tempdir().expect("temp");
+    let mut command = Command::new(binary());
+    with_xdg(&mut command, temp.path());
+    let output = command
+        .args(["run", "--task", "hello", "--json"])
+        .output()
+        .expect("run");
+    assert!(output.status.success());
+
+    let mut command = Command::new(binary());
+    with_xdg(&mut command, temp.path());
+    let output = command.arg("events").output().expect("events");
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("stdout");
+    assert!(stdout.contains("\"kind\":\"turn_completed\""), "{stdout}");
+}

@@ -112,6 +112,30 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Run the local WebSocket daemon.
+    Daemon {
+        /// Bind address.
+        #[arg(long, default_value = "127.0.0.1:0")]
+        addr: String,
+        /// Required client token. Generated when omitted.
+        #[arg(long)]
+        token: Option<String>,
+        /// Provider backend.
+        #[arg(long, value_enum)]
+        provider: Option<ProviderChoice>,
+        /// Model identifier.
+        #[arg(long)]
+        model: Option<String>,
+    },
+    /// Print the Event Log, optionally following new events.
+    Events {
+        /// Only this session.
+        #[arg(long)]
+        session: Option<String>,
+        /// Follow new events until interrupted.
+        #[arg(long)]
+        follow: bool,
+    },
     /// Inspect or release workspace leases.
     Lease {
         #[command(subcommand)]
@@ -300,11 +324,63 @@ async fn main() -> anyhow::Result<()> {
             limit,
             json,
         } => history(query, session, workspace, limit, json).await,
+        Command::Daemon {
+            addr,
+            token,
+            provider,
+            model,
+        } => daemon(addr, token, provider, model).await,
+        Command::Events { session, follow } => events(session, follow).await,
         Command::Lease { command } => lease(command).await,
         Command::Doctor => doctor(),
         Command::Auth { command } => auth(command),
         Command::Trust { status, remove } => trust(status, remove),
     }
+}
+
+async fn daemon(
+    addr: String,
+    token: Option<String>,
+    provider: Option<ProviderChoice>,
+    model: Option<String>,
+) -> anyhow::Result<()> {
+    let runtime = build_runtime(None, provider, model)?;
+    let addr: std::net::SocketAddr = addr.parse().context("invalid daemon address")?;
+    let token = token.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    eprintln!("thais daemon: ws://{addr}/?token={token}");
+    thais_core::serve_websocket(runtime, addr, token).await?;
+    Ok(())
+}
+
+async fn events(session: Option<String>, follow: bool) -> anyhow::Result<()> {
+    let paths = Paths::discover()?;
+    paths.ensure()?;
+    let storage = StorageHandle::open(paths.database_path())?;
+    let mut sessions = match session {
+        Some(session) => vec![storage.get_session(session).await?],
+        None => storage.list_sessions_with_archived(true).await?,
+    };
+    let mut sequences = std::collections::HashMap::new();
+    loop {
+        for session in &sessions {
+            let last = sequences.get(&session.session_id).copied().unwrap_or(0);
+            let events = storage
+                .events_after(session.session_id.clone(), last)
+                .await?;
+            for event in events {
+                sequences.insert(session.session_id.clone(), event.seq);
+                println!("{}", serde_json::to_string(&event)?);
+            }
+        }
+        if !follow {
+            break;
+        }
+        if sessions.is_empty() {
+            sessions = storage.list_sessions_with_archived(true).await?;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    Ok(())
 }
 
 async fn lease(command: LeaseCommand) -> anyhow::Result<()> {

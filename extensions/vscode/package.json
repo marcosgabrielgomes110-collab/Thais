@@ -1,0 +1,32 @@
+{
+  "name": "thais-vscode",
+  "displayName": "Thais",
+  "description": "Local-first coding agent for VS Code",
+  "version": "0.1.0",
+  "publisher": "thais",
+  "engines": { "vscode": "^1.90.0" },
+  "categories": ["Other"],
+  "activationEvents": ["onCommand:thais.connect"],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      { "command": "thais.connect", "title": "Thais: Connect to daemon" },
+      { "command": "thais.newSession", "title": "Thais: New session" },
+      { "command": "thais.send", "title": "Thais: Send task" },
+      { "command": "thais.sessions", "title": "Thais: Switch session" },
+      { "command": "thais.models", "title": "Thais: Select model" },
+      { "command": "thais.approve", "title": "Thais: Resolve approval" }
+    ]
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "dependencies": { "ws": "^8.18.0" },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/vscode": "^1.90.0",
+    "@types/ws": "^8.5.10",
+    "typescript": "^5.6.0"
+  }
+}

@@ -1,6 +1,6 @@
 # Thais Agent API v1
 
-- Status: M5 protocol
+- Status: M7 protocol
 - Version: `1.0`
 - Transport: JSON-RPC 2.0 over stdio; one JSON message per line (NDJSON)
 - Boundary: all clients use this protocol through `thais-sdk`; no client imports core internals
@@ -17,7 +17,10 @@ Responses and notifications may interleave; clients route responses by `id`
 and events by `method`.
 
 WebSocket transport (M7) uses the same message objects with one JSON message
-per WebSocket frame.
+per WebSocket frame. The daemon binds to localhost and requires a token:
+`ws://127.0.0.1:8787/?token=<token>`. A connection without the token is rejected
+during the handshake. Multiple clients per session receive the same events;
+approvals are first-wins and broadcast as `permission.resolved`.
 
 ## Handshake
 

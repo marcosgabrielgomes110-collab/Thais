@@ -429,14 +429,14 @@ M3 can run in parallel with M2 after M1. The critical path is M0 → M1 → M2 �
 | M4 Memory and continuity | Done | 3–5 weeks |
 | M5 Tool ecosystem | Done | 5–7 weeks |
 | M6 Hardening | Done (Linux) | 5–7 weeks |
-| M7 Productization | Planned | 6–9 weeks |
+| M7 Productization | Done | 6–9 weeks |
 | M8 Post-v1 | Planned | Continuous |
 
 Estimates assume one developer with systems experience but new to Rust and this codebase. Ranges include a learning buffer of roughly 50% and are not commitments. The Alpha estimate is cumulative, not additive. Adjust after M0.
 
 ## Current focus
 
-**M6 is done for Linux and tagged (`v0.7.0-m6`).** M0 through M5 are tagged (`v0.6.0-m5`). The Linux hardening path includes namespaces/Landlock/seccomp, tool-output redaction, prompt-injection tests, idempotent event append, symlink-safe credentials, lease recovery, and a bounded TUI transcript. Stable cross-platform work (Seatbelt, Job Objects, PTY/ConPTY, Windows tests, fuzzing/loom, performance) is tracked for the stable release.
+**M7 is done and tagged (`v0.8.0-m7`).** M0 through M6 are tagged (`v0.7.0-m6`). The productization path includes the WebSocket daemon, multi-client events, `events --follow`, the VS Code extension, packaging metadata, Docker, install docs, and a changelog. The v1.0 stable gate still tracks Seatbelt, Job Objects, PTY/ConPTY, Windows tests, fuzzing/loom, signing/SBOM, and the performance pass.
 
 Alpha is the first daily-use release: M0 + M1 + M2 + a simple checkpoint. The next gate is a developer using Alpha on a real repository for a week without losing work.
 
@@ -744,6 +744,8 @@ environment-leak coverage, and the performance pass.
 
 ### M7 — Productization
 
+**Status:** Done (`v0.8.0-m7`).
+
 **Goal:** Ship an installable v1 with more than one client and a stable protocol.
 
 **Depends on:** Alpha through M6.
@@ -766,6 +768,12 @@ environment-leak coverage, and the performance pass.
 - Upgrade from the previous release preserves sessions and configuration.
 - Release artifacts are signed and documented.
 - All v1 exit criteria below are met.
+
+**Implementation notes:** M7 adds the local WebSocket daemon with token auth
+and multi-client event fan-out, `thais events --follow`, a VS Code extension
+scaffold, cargo-dist metadata, Dockerfile, install documentation, and a
+changelog. Signed artifacts, SBOM generation, and the stable cross-platform
+matrix remain release-gate work.
 
 **Out of scope:** Cloud sync, team workspaces, multi-user server.
 
@@ -932,6 +940,7 @@ There are no open v1 decisions. The next decision that needs a choice gets a new
 | 2026-10-24 | Implemented M5 tool ecosystem: LSP, MCP stdio/HTTP, child sessions and subagents, and gated Git log/show/commit |
 | 2026-10-24 | Started M6 hardening: sandbox detection/fallback, tool-output redaction, expanded secret patterns, and security tests |
 | 2026-10-24 | Closed M6 for Linux: Landlock + seccomp helper, sandbox tests, idempotent events, symlink-safe credentials, lease recovery, and security documentation |
+| 2026-10-24 | Closed M7: WebSocket daemon, token auth, multi-client events, VS Code scaffold, packaging metadata, Docker, install docs, and changelog |
 | 2026-10-23 | Implemented the M2 build loop: write/edit/apply_patch, bash, git read tools, shadow-Git snapshots, rollback, verifier, plan approval, diff previews, personality file, and audit events |
 | 2026-10-23 | M1 accepted by CI; M2 implementation started |
 | 2026-10-23 | M2 accepted by CI on Linux/macOS, Windows check, and audit; tagged `v0.3.0-m2`; M1 tagged `v0.2.0-m1` |

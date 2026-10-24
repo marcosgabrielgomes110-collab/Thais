@@ -231,6 +231,8 @@ thais sessions --all
 thais history "decisão"
 thais lease status --workspace .
 thais lease release --workspace .
+thais daemon --addr 127.0.0.1:8787
+thais events --follow
 ```
 
 - Checkpoints ficam em `~/.local/share/thais/sessions/<id>/checkpoint.md`.
@@ -273,7 +275,8 @@ thais lease release --workspace .
 | M4 — Memory and continuity | Done | `v0.5.0-m4` |
 | M5 — Tool ecosystem | Done | `v0.6.0-m5` |
 | Alpha | Feedback gate | em uso real |
-| M6 — Hardening | Done no Linux | cross-platform no stable |
+| M6 — Hardening | Done no Linux | `v0.7.0-m6` |
+| M7 — Productization | Done | `v0.8.0-m7` |
 
 O Alpha continua sendo o gate de feedback em repositório real. O **M6** está
 em andamento: a primeira camada já está no `main`, mas o marco ainda não foi
@@ -295,13 +298,19 @@ Já implementado:
 - Testes de prompt injection, redaction e recuperação de lease expirado.
 - TUI limita o transcript renderizado para evitar crescimento sem limite.
 
-O Linux está fechado para o M6. O stable cross-platform ainda precisa de:
+### M7 productization
 
-- Seatbelt nativo no macOS e Job Objects no Windows.
-- PTY/ConPTY nativo.
-- Matriz de testes Windows, fuzzing de protocolo e testes com `loom`.
-- Cobertura completa de environment leakage.
-- Pass de performance de contexto, SQLite, eventos e TUI.
+- Daemon WebSocket local em `127.0.0.1` com token obrigatório.
+- Múltiplos clientes por sessão, com eventos compartilhados e aprovação first-wins.
+- `thais events --follow` e `thais events --session <id>`.
+- Extensão VS Code em `extensions/vscode`: conectar, criar sessão, enviar task,
+  trocar sessão, escolher modelo e aprovar ações.
+- `dist-workspace.toml`, `Dockerfile`, `docs/install.md` e `CHANGELOG.md`.
+- Empacotamento preparado para Linux, macOS e Windows; assinatura e SBOM ficam
+  no checklist do release stable.
+
+O stable cross-platform ainda precisa de Seatbelt, Job Objects, PTY/ConPTY,
+matriz de testes Windows, fuzzing/loom e o pass de performance.
 
 ## Documentação
 
@@ -317,6 +326,8 @@ O Linux está fechado para o M6. O stable cross-platform ainda precisa de:
 | [docs/mcp.example.toml](docs/mcp.example.toml) | servidores MCP |
 | [docs/verifier.example.toml](docs/verifier.example.toml) | comandos de verificação |
 | [PERSONALITY.md](PERSONALITY.md) | tom e estilo do agente |
+| [docs/install.md](docs/install.md) | instalação, Docker e artefatos |
+| [CHANGELOG.md](CHANGELOG.md) | histórico de releases |
 
 ## Desenvolvimento
 
@@ -324,6 +335,7 @@ O Linux está fechado para o M6. O stable cross-platform ainda precisa de:
 make check      # fmt, clippy, testes e boundary arquitetural
 make build      # release build
 cargo deny check
+scripts/release.sh v0.8.0-m7
 ```
 
 A CI roda em Linux, macOS e Windows (check), além de audit de dependências.

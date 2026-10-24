@@ -14,6 +14,7 @@ pub mod runtime;
 pub mod server;
 pub mod snapshot;
 pub mod verifier;
+pub mod ws;
 
 pub use checkpoint::{CheckpointError, CheckpointState, read_checkpoint, write_checkpoint};
 pub use clock::{Clock, FixedClock, SystemClock};
@@ -28,6 +29,7 @@ pub use server::{ServerError, serve, serve_stdio};
 pub use snapshot::{Snapshot, SnapshotError, SnapshotManager};
 pub use thais_tools::{LspConfig, McpConfig, Sandbox, SandboxBackend, SandboxMode};
 pub use verifier::{Verification, Verifier, VerifierError};
+pub use ws::{serve_websocket, serve_websocket_listener};
 
 /// Version of the core crate.
 pub const CORE_VERSION: &str = env!("CARGO_PKG_VERSION");
