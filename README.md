@@ -338,6 +338,7 @@ make sbom       # CycloneDX SBOM
 make fuzz-check # type-check fuzz targets
 scripts/release.sh v1.0.0 --allow-unsigned  # local release check
 scripts/verify-release.sh
+scripts/perf.sh  # first task and event-log latency
 ```
 
 A CI roda em Linux, além de audit de dependências.

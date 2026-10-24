@@ -6,6 +6,7 @@
 - Added GPG signing and release verification scripts.
 - Added `cargo-fuzz` protocol/tool-argument targets and stable proptest coverage.
 - Added a two-client WebSocket event test.
+- Added a Linux performance smoke test with thresholds.
 - Scoped v1.0 to Linux; macOS and Windows are post-v1.
 
 ## v0.8.0-m7

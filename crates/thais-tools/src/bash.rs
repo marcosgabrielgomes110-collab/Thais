@@ -265,6 +265,33 @@ mod tests {
     }
 
     #[test]
+    fn scrubbed_environment_only_contains_the_allowlist() {
+        let mut process = Command::new("sh");
+        scrub_environment(&mut process);
+        #[cfg(unix)]
+        let allowed = [
+            "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "TERM", "TMPDIR", "TZ",
+        ];
+        #[cfg(windows)]
+        let allowed = [
+            "PATH",
+            "USERPROFILE",
+            "HOMEDRIVE",
+            "HOMEPATH",
+            "SystemRoot",
+            "COMSPEC",
+            "PATHEXT",
+            "TEMP",
+            "TMP",
+            "WINDIR",
+        ];
+        for (key, _) in process.get_envs() {
+            let key = key.to_string_lossy();
+            assert!(allowed.contains(&key.as_ref()), "unexpected env var: {key}");
+        }
+    }
+
+    #[test]
     fn bash_rejects_a_cwd_escape() {
         let temp = tempfile::tempdir().expect("temp");
         let registry = ToolRegistry::read_write(temp.path()).expect("registry");

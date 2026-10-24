@@ -20,7 +20,7 @@ ifneq ($(WORKSPACE),)
 TUI_ARGS += --workspace "$(WORKSPACE)"
 endif
 
-.PHONY: all setup tools check fmt fmt-check lint test boundary build run tui fake cohere install uninstall clean ci audit doctor sbom fuzz-check fuzz help
+.PHONY: all setup tools check fmt fmt-check lint test boundary build run tui fake cohere install uninstall clean ci audit doctor sbom fuzz-check fuzz perf help
 
 all: setup check build
 
@@ -112,6 +112,9 @@ fuzz-check:
 fuzz:
 	scripts/fuzz.sh
 
+perf:
+	scripts/perf.sh
+
 
 help:
 	@printf '%s\n' \
@@ -141,4 +144,5 @@ help:
 		'  make sbom         generate target/thais-sbom.cdx.json' \
 		'  make fuzz-check   type-check the cargo-fuzz targets' \
 		'  make fuzz         run cargo-fuzz for 30 seconds per target' \
+		'  make perf         measure release startup and event-log latency' \
 		'  make help         show this help'
