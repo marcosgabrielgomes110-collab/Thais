@@ -7,10 +7,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, bail};
-use clap::{Parser, Subcommand};
-use thais_core::{Runtime, SystemClock, UuidGenerator};
+use clap::{Parser, Subcommand, ValueEnum};
+use thais_core::{ContextManager, Runtime, SystemClock, UuidGenerator};
 use thais_protocol::event::{EventEnvelope, EventKind};
-use thais_providers::{FakeProvider, FakeScript, FakeStep, Provider};
+use thais_protocol::jsonrpc::{Message, Notification};
+use thais_protocol::method;
+use thais_providers::{
+    COHERE_DEFAULT_MODEL, FakeProvider, FakeScript, FakeStep, OpenAiCompatibleProvider, Provider,
+};
+use thais_sdk::channel;
 use thais_storage::{CredentialStore, Paths, Storage, StorageHandle, trust_key};
 
 #[derive(Debug, Parser)]
@@ -32,14 +37,26 @@ enum Command {
         /// Use NDJSON framing over stdio.
         #[arg(long)]
         stdio: bool,
-        /// Fake provider script (JSON).
+        /// Provider backend.
+        #[arg(long, value_enum)]
+        provider: Option<ProviderChoice>,
+        /// Model identifier.
         #[arg(long)]
+        model: Option<String>,
+        /// Fake provider script (JSON). Conflicts with --provider.
+        #[arg(long, conflicts_with = "provider")]
         fake: Option<PathBuf>,
     },
-    /// Run a headless turn with the fake provider.
+    /// Run a headless turn.
     Run {
-        /// Fake provider script (JSON).
+        /// Provider backend.
+        #[arg(long, value_enum)]
+        provider: Option<ProviderChoice>,
+        /// Model identifier.
         #[arg(long)]
+        model: Option<String>,
+        /// Fake provider script (JSON). Conflicts with --provider.
+        #[arg(long, conflicts_with = "provider")]
         fake: Option<PathBuf>,
         /// Emit NDJSON events instead of human-readable output.
         #[arg(long)]
@@ -47,6 +64,18 @@ enum Command {
         /// Task text.
         #[arg(long)]
         task: Option<String>,
+        /// Workspace root. Defaults to the current directory.
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+    },
+    /// Open the interactive TUI.
+    Tui {
+        /// Provider backend.
+        #[arg(long, value_enum)]
+        provider: Option<ProviderChoice>,
+        /// Model identifier.
+        #[arg(long)]
+        model: Option<String>,
         /// Workspace root. Defaults to the current directory.
         #[arg(long)]
         workspace: Option<PathBuf>,
@@ -67,6 +96,14 @@ enum Command {
         #[arg(long)]
         remove: bool,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ProviderChoice {
+    /// Deterministic scripted provider.
+    Fake,
+    /// Cohere through the OpenAI-compatible Compatibility API.
+    Cohere,
 }
 
 #[derive(Debug, Subcommand)]
@@ -99,53 +136,83 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     match Cli::parse().command {
-        Command::Serve { stdio, fake } => {
+        Command::Serve {
+            stdio,
+            provider,
+            model,
+            fake,
+        } => {
             if !stdio {
                 bail!("only `thais serve --stdio` is supported in M0");
             }
-            let runtime = build_runtime(fake)?;
+            let runtime = build_runtime(fake, provider, model)?;
             thais_core::serve_stdio(runtime).await?;
             Ok(())
         }
         Command::Run {
+            provider,
+            model,
             fake,
             json,
             task,
             workspace,
-        } => run(fake, json, task, workspace).await,
+        } => run(fake, provider, model, json, task, workspace).await,
+        Command::Tui {
+            provider,
+            model,
+            workspace,
+        } => tui(provider, model, workspace).await,
         Command::Doctor => doctor(),
         Command::Auth { command } => auth(command),
         Command::Trust { status, remove } => trust(status, remove),
     }
 }
 
-fn build_runtime(fake: Option<PathBuf>) -> anyhow::Result<Arc<Runtime>> {
+fn build_runtime(
+    fake: Option<PathBuf>,
+    provider: Option<ProviderChoice>,
+    model: Option<String>,
+) -> anyhow::Result<Arc<Runtime>> {
     let paths = Paths::discover()?;
     paths.ensure()?;
     let storage = StorageHandle::open(paths.database_path())?;
 
-    let script = match fake {
-        Some(path) => FakeScript::from_file(&path)
-            .with_context(|| format!("could not load fake script {}", path.display()))?,
-        None => FakeScript {
-            model: Some("fake-model".to_owned()),
-            steps: vec![FakeStep::Text {
-                text: "M0 fake provider ready.".to_owned(),
-            }],
-        },
+    let provider: Arc<dyn Provider> = match provider.unwrap_or(ProviderChoice::Fake) {
+        ProviderChoice::Fake => {
+            let script = match fake {
+                Some(path) => FakeScript::from_file(&path)
+                    .with_context(|| format!("could not load fake script {}", path.display()))?,
+                None => FakeScript {
+                    model: Some(model.unwrap_or_else(|| "fake-model".to_owned())),
+                    steps: vec![FakeStep::Text {
+                        text: "M0 fake provider ready.".to_owned(),
+                    }],
+                },
+            };
+            Arc::new(FakeProvider::new("fake", script))
+        }
+        ProviderChoice::Cohere => {
+            let key = std::env::var("THAIS_COHERE_API_KEY")
+                .or_else(|_| std::env::var("COHERE_API_KEY"))
+                .context("set THAIS_COHERE_API_KEY or COHERE_API_KEY for `--provider cohere`")?;
+            let model = model.unwrap_or_else(|| COHERE_DEFAULT_MODEL.to_owned());
+            Arc::new(OpenAiCompatibleProvider::cohere(key, model)?)
+        }
     };
-    let provider: Arc<dyn Provider> = Arc::new(FakeProvider::new("fake", script));
 
     Ok(Arc::new(Runtime::new(
         storage,
         provider,
         Arc::new(SystemClock),
         Arc::new(UuidGenerator),
+        ContextManager::new(paths),
     )))
 }
 
 async fn run(
     fake: Option<PathBuf>,
+    provider: Option<ProviderChoice>,
+    model: Option<String>,
     json: bool,
     task: Option<String>,
     workspace: Option<PathBuf>,
@@ -155,7 +222,7 @@ async fn run(
         None => std::env::current_dir().context("could not determine the current directory")?,
     };
     let task = task.unwrap_or_else(|| "Say hello from the fake provider.".to_owned());
-    let runtime = build_runtime(fake)?;
+    let runtime = build_runtime(fake, provider, model)?;
     let (session, turn_id, events) = runtime
         .run_once(workspace.to_string_lossy().into_owned(), task, None)
         .await?;
@@ -172,8 +239,78 @@ async fn run(
         session_id = %session.session_id,
         turn_id = %turn_id,
         events = events.len(),
-        "fake turn complete"
+        "turn complete"
     );
+    Ok(())
+}
+
+async fn tui(
+    provider: Option<ProviderChoice>,
+    model: Option<String>,
+    workspace: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    let workspace = match workspace {
+        Some(workspace) => workspace.to_string_lossy().into_owned(),
+        None => std::env::current_dir()
+            .context("could not determine the current directory")?
+            .to_string_lossy()
+            .into_owned(),
+    };
+    let runtime = build_runtime(None, provider, model.clone())?;
+    let (client_transport, mut server) = channel::pair();
+    let request_sender = server.sender();
+    let event_sender = server.sender();
+    let request_runtime = Arc::clone(&runtime);
+
+    tokio::spawn(async move {
+        while let Some(request) = server.recv().await {
+            let outcome = request_runtime.handle_request(request).await;
+            if request_sender
+                .send(Message::Response(outcome.response))
+                .await
+                .is_err()
+            {
+                break;
+            }
+            for event in outcome.replay {
+                let notification =
+                    Notification::new(method::SESSION_EVENT, serde_json::json!({"event": event}));
+                if request_sender
+                    .send(Message::Notification(notification))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }
+    });
+
+    let mut live = runtime.subscribe_live();
+    tokio::spawn(async move {
+        loop {
+            match live.recv().await {
+                Ok(event) => {
+                    let notification = Notification::new(
+                        method::SESSION_EVENT,
+                        serde_json::json!({"event": event}),
+                    );
+                    if event_sender
+                        .send(Message::Notification(notification))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(_) => break,
+            }
+        }
+    });
+
+    let client = thais_sdk::Client::new(client_transport);
+    thais_tui::run(client, workspace, model).await?;
     Ok(())
 }
 

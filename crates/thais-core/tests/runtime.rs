@@ -4,6 +4,7 @@ use std::time::Duration;
 use serde_json::json;
 use tempfile::TempDir;
 use thais_core::clock::FixedClock;
+use thais_core::context::ContextManager;
 use thais_core::ids::SequenceIdGenerator;
 use thais_core::runtime::{Runtime, RuntimeError};
 use thais_protocol::event::EventKind;
@@ -22,14 +23,20 @@ fn script(steps: Vec<FakeStep>) -> FakeScript {
 }
 
 fn runtime(temp: &TempDir, script: FakeScript) -> Arc<Runtime> {
+    runtime_with_scripts(temp, vec![script])
+}
+
+fn runtime_with_scripts(temp: &TempDir, scripts: Vec<FakeScript>) -> Arc<Runtime> {
     let storage =
         thais_storage::StorageHandle::open(temp.path().join("thais.db")).expect("storage");
-    let provider: Arc<dyn thais_providers::Provider> = Arc::new(FakeProvider::new("fake", script));
+    let provider: Arc<dyn thais_providers::Provider> =
+        Arc::new(FakeProvider::with_scripts("fake", scripts));
     Arc::new(Runtime::new(
         storage,
         provider,
         Arc::new(FixedClock::new("2026-10-23T00:00:00Z")),
         Arc::new(SequenceIdGenerator::new("t")),
+        ContextManager::empty(),
     ))
 }
 
@@ -358,4 +365,190 @@ async fn send_rejects_a_second_turn_while_one_is_active() {
         .await;
     assert!(matches!(second, Err(RuntimeError::TurnInProgress(_))));
     let _ = runtime.cancel(&session.session_id, None).await;
+}
+
+#[tokio::test]
+async fn tool_call_loop_reads_a_file_and_returns_the_result() {
+    let temp = tempfile::tempdir().expect("temp");
+    std::fs::write(
+        temp.path().join("Cargo.toml"),
+        "[package]\nname = \"demo\"\n",
+    )
+    .expect("cargo");
+    let runtime = runtime_with_scripts(
+        &temp,
+        vec![
+            script(vec![FakeStep::ToolCall {
+                index: 0,
+                id: "call_1".to_owned(),
+                name: "read".to_owned(),
+                arguments: json!({"path": "Cargo.toml"}).to_string(),
+            }]),
+            script(vec![FakeStep::Text {
+                text: "done".to_owned(),
+            }]),
+        ],
+    );
+
+    let (_, _, events) = runtime
+        .run_once(
+            temp.path().to_string_lossy().into_owned(),
+            "read Cargo.toml".to_owned(),
+            None,
+        )
+        .await
+        .expect("run");
+
+    let kinds = events.iter().map(|event| event.kind).collect::<Vec<_>>();
+    assert!(kinds.contains(&EventKind::ToolCall));
+    assert!(kinds.contains(&EventKind::ToolResult));
+    assert_eq!(events.last().expect("last").kind, EventKind::TurnCompleted);
+
+    let result = events
+        .iter()
+        .find(|event| event.kind == EventKind::ToolResult)
+        .expect("tool result");
+    assert_eq!(result.payload["is_error"], false);
+    assert!(
+        result.payload["content"]
+            .as_str()
+            .expect("content")
+            .contains("name = \"demo\"")
+    );
+}
+
+#[tokio::test]
+async fn multiple_tool_calls_are_executed_in_one_iteration() {
+    let temp = tempfile::tempdir().expect("temp");
+    std::fs::write(
+        temp.path().join("Cargo.toml"),
+        "[package]\nname = \"demo\"\n",
+    )
+    .expect("cargo");
+    std::fs::write(temp.path().join("README.md"), "# demo\n").expect("readme");
+    let runtime = runtime_with_scripts(
+        &temp,
+        vec![
+            script(vec![
+                FakeStep::ToolCall {
+                    index: 0,
+                    id: "call_1".to_owned(),
+                    name: "read".to_owned(),
+                    arguments: json!({"path": "Cargo.toml"}).to_string(),
+                },
+                FakeStep::ToolCall {
+                    index: 1,
+                    id: "call_2".to_owned(),
+                    name: "read".to_owned(),
+                    arguments: json!({"path": "README.md"}).to_string(),
+                },
+            ]),
+            script(vec![FakeStep::Text {
+                text: "done".to_owned(),
+            }]),
+        ],
+    );
+
+    let (_, _, events) = runtime
+        .run_once(
+            temp.path().to_string_lossy().into_owned(),
+            "read both".to_owned(),
+            None,
+        )
+        .await
+        .expect("run");
+
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == EventKind::ToolCall)
+            .count(),
+        2
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == EventKind::ToolResult)
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn sensitive_read_is_denied_by_the_user_and_logged() {
+    let temp = tempfile::tempdir().expect("temp");
+    std::fs::write(temp.path().join(".env"), "TOKEN=secret\n").expect("env");
+    let runtime = runtime_with_scripts(
+        &temp,
+        vec![
+            script(vec![FakeStep::ToolCall {
+                index: 0,
+                id: "call_1".to_owned(),
+                name: "read".to_owned(),
+                arguments: json!({"path": ".env"}).to_string(),
+            }]),
+            script(vec![FakeStep::Text {
+                text: "done".to_owned(),
+            }]),
+        ],
+    );
+
+    let mut live = runtime.subscribe_live();
+    let session = runtime
+        .create_session(
+            temp.path().to_string_lossy().into_owned(),
+            SessionMode::Build,
+            None,
+        )
+        .await
+        .expect("session");
+    runtime
+        .send(&session.session_id, "read the env".to_owned(), None)
+        .await
+        .expect("send");
+
+    let approval_id = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let event = live.recv().await.expect("event");
+            if event.kind == EventKind::PermissionRequested {
+                break event.payload["approval_id"]
+                    .as_str()
+                    .expect("approval id")
+                    .to_owned();
+            }
+        }
+    })
+    .await
+    .expect("permission requested");
+
+    assert!(
+        runtime
+            .approve(&session.session_id, &approval_id, ApprovalDecision::Deny)
+            .await
+            .expect("deny")
+    );
+
+    let result = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let event = live.recv().await.expect("event");
+            if event.kind == EventKind::ToolResult {
+                break event;
+            }
+        }
+    })
+    .await
+    .expect("tool result");
+    assert_eq!(result.payload["is_error"], true);
+    assert_eq!(result.payload["content"], "denied by user");
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let event = live.recv().await.expect("event");
+            if event.kind == EventKind::TurnCompleted {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("turn completed");
 }

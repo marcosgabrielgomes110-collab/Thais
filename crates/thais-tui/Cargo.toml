@@ -9,6 +9,10 @@ publish.workspace = true
 thais-protocol = { version = "0.1.0", path = "../thais-protocol" }
 thais-sdk = { version = "0.1.0", path = "../thais-sdk" }
 anyhow.workspace = true
+crossterm.workspace = true
+futures-util.workspace = true
+ratatui.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 

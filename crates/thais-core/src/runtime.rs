@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures_util::StreamExt;
 use serde::Serialize;
@@ -19,14 +20,23 @@ use thais_protocol::session::{
     SessionCreateResult, SessionInfo, SessionMode, SessionSendParams, SessionSendResult,
     SessionStatus, SessionSubscribeParams, SessionSubscribeResult,
 };
-use thais_providers::{ChatEvent, ChatMessage, ChatRequest, Provider, Role, Usage};
+use thais_providers::{
+    ChatEvent, ChatMessage, ChatRequest, Provider, ToolCall, ToolDefinition, Usage,
+};
 use thais_storage::{NewEvent, StorageError, StorageHandle};
+use thais_tools::{PermissionDecision, PermissionGate, ToolError, ToolRegistry, ToolResult};
 use thiserror::Error;
 use tokio::sync::{Mutex, broadcast, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::clock::Clock;
+use crate::context::{ContextError, ContextManager, estimate_tokens};
 use crate::ids::IdGenerator;
+
+const MAX_TOOL_ITERATIONS: usize = 8;
+const MAX_TURN_TOKENS: u64 = 50_000;
+const MAX_TURN_TIME: Duration = Duration::from_secs(180);
+const APPROVAL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Runtime failures.
 #[derive(Debug, Error)]
@@ -52,6 +62,12 @@ pub enum RuntimeError {
     /// The workspace path is not valid UTF-8.
     #[error("workspace path is not valid UTF-8")]
     InvalidWorkspace,
+    /// Prompt assembly failure.
+    #[error("context error: {0}")]
+    Context(#[from] ContextError),
+    /// Tool execution failure.
+    #[error("tool error: {0}")]
+    Tool(#[from] ToolError),
 }
 
 impl RuntimeError {
@@ -62,7 +78,9 @@ impl RuntimeError {
             | Self::ApprovalNotFound(_)
             | Self::InvalidRequest(_)
             | Self::InvalidWorkspace => INVALID_PARAMS,
-            Self::Storage(_) | Self::Provider(_) => INTERNAL_ERROR,
+            Self::Storage(_) | Self::Provider(_) | Self::Context(_) | Self::Tool(_) => {
+                INTERNAL_ERROR
+            }
         };
         ErrorObject::new(code, self.to_string())
     }
@@ -105,6 +123,8 @@ impl RequestOutcome {
 
 struct SessionState {
     turn: Option<TurnState>,
+    tools: Arc<ToolRegistry>,
+    gate: PermissionGate,
 }
 
 struct TurnState {
@@ -118,6 +138,7 @@ pub struct Runtime {
     provider: Arc<dyn Provider>,
     clock: Arc<dyn Clock>,
     ids: Arc<dyn IdGenerator>,
+    context: ContextManager,
     sessions: Mutex<HashMap<String, SessionState>>,
     approvals: Mutex<HashMap<String, oneshot::Sender<ApprovalDecision>>>,
     events: broadcast::Sender<EventEnvelope>,
@@ -131,6 +152,7 @@ impl Runtime {
         provider: Arc<dyn Provider>,
         clock: Arc<dyn Clock>,
         ids: Arc<dyn IdGenerator>,
+        context: ContextManager,
     ) -> Self {
         let (events, _) = broadcast::channel(1024);
         Self {
@@ -138,6 +160,7 @@ impl Runtime {
             provider,
             clock,
             ids,
+            context,
             sessions: Mutex::new(HashMap::new()),
             approvals: Mutex::new(HashMap::new()),
             events,
@@ -187,10 +210,15 @@ impl Runtime {
         };
 
         self.storage.create_session(info.clone()).await?;
-        self.sessions
-            .lock()
-            .await
-            .insert(session_id.clone(), SessionState { turn: None });
+        let tools = ToolRegistry::read_only(Path::new(&info.workspace))?;
+        self.sessions.lock().await.insert(
+            session_id.clone(),
+            SessionState {
+                turn: None,
+                tools: Arc::new(tools),
+                gate: PermissionGate,
+            },
+        );
         self.append_event(
             &session_id,
             EventKind::SessionCreated,
@@ -234,11 +262,21 @@ impl Runtime {
             });
         }
 
+        let (tools, gate) = {
+            let sessions = self.sessions.lock().await;
+            let state = sessions
+                .get(session_id)
+                .ok_or_else(|| RuntimeError::SessionNotFound(session_id.to_owned()))?;
+            (Arc::clone(&state.tools), state.gate)
+        };
+
         let runtime = Arc::clone(self);
         let session = session_id.to_owned();
         let turn = turn_id.clone();
         tokio::spawn(async move {
-            runtime.run_turn(session, turn, input, cancel).await;
+            runtime
+                .run_turn(session, turn, input, cancel, tools, gate)
+                .await;
         });
         Ok(turn_id)
     }
@@ -300,12 +338,28 @@ impl Runtime {
         self.append_event(
             session_id,
             EventKind::PermissionRequested,
-            json!({"approval_id": approval_id, "action": action}),
+            json!({"approval_id": approval_id.clone(), "action": action}),
         )
         .await?;
-        receiver
-            .await
-            .map_err(|_| RuntimeError::ApprovalNotFound(approval_id))
+
+        match tokio::time::timeout(APPROVAL_TIMEOUT, receiver).await {
+            Ok(Ok(decision)) => Ok(decision),
+            Ok(Err(_)) => Err(RuntimeError::ApprovalNotFound(approval_id)),
+            Err(_) => {
+                self.approvals.lock().await.remove(&approval_id);
+                self.append_event(
+                    session_id,
+                    EventKind::PermissionResolved,
+                    json!({
+                        "approval_id": approval_id,
+                        "decision": "deny",
+                        "reason": "approval timeout"
+                    }),
+                )
+                .await?;
+                Ok(ApprovalDecision::Deny)
+            }
+        }
     }
 
     /// Subscribe to a session, optionally replaying events after `from_seq`.
@@ -523,9 +577,11 @@ impl Runtime {
         turn_id: String,
         input: String,
         cancel: CancellationToken,
+        tools: Arc<ToolRegistry>,
+        gate: PermissionGate,
     ) {
         if let Err(error) = self
-            .run_turn_inner(&session_id, &turn_id, &input, &cancel)
+            .run_turn_inner(&session_id, &turn_id, &input, &cancel, tools, gate)
             .await
         {
             let _ = self
@@ -554,8 +610,14 @@ impl Runtime {
         turn_id: &str,
         input: &str,
         cancel: &CancellationToken,
+        tools: Arc<ToolRegistry>,
+        gate: PermissionGate,
     ) -> Result<(), RuntimeError> {
         let session = self.storage.get_session(session_id.to_owned()).await?;
+        let bundle = self
+            .context
+            .build(Path::new(&session.workspace), input)
+            .await?;
         self.append_event(
             session_id,
             EventKind::TurnStarted,
@@ -563,20 +625,176 @@ impl Runtime {
         )
         .await?;
 
-        let request = ChatRequest {
-            model: session.model,
-            messages: vec![ChatMessage {
-                role: Role::User,
-                content: input.to_owned(),
-            }],
-            ..ChatRequest::default()
-        };
-        let mut stream = self.provider.chat(request).await?;
-        let mut usage = Usage::default();
+        let tool_definitions = tools
+            .definitions()
+            .into_iter()
+            .map(|definition| ToolDefinition {
+                name: definition.name,
+                description: definition.description,
+                parameters: definition.parameters,
+            })
+            .collect::<Vec<_>>();
+        let mut messages = vec![
+            ChatMessage::system(bundle.system),
+            ChatMessage::user(bundle.user),
+        ];
+        let mut total_tokens = bundle.estimated_tokens as u64;
+        let mut total_usage = Usage::default();
+        let started = tokio::time::Instant::now();
 
-        loop {
-            tokio::select! {
-                () = cancel.cancelled() => {
+        for _ in 0..MAX_TOOL_ITERATIONS {
+            if started.elapsed() > MAX_TURN_TIME {
+                return Err(RuntimeError::InvalidRequest(
+                    "time budget exhausted".to_owned(),
+                ));
+            }
+            if total_tokens > MAX_TURN_TOKENS {
+                return Err(RuntimeError::InvalidRequest(
+                    "token budget exhausted".to_owned(),
+                ));
+            }
+
+            let request = ChatRequest {
+                model: session.model.clone(),
+                messages: messages.clone(),
+                tools: tool_definitions.clone(),
+                ..ChatRequest::default()
+            };
+            let mut stream = self.provider.chat(request).await?;
+            let mut content = String::new();
+            let mut accumulators: HashMap<usize, ToolAccumulator> = HashMap::new();
+            let mut usage = Usage::default();
+
+            loop {
+                tokio::select! {
+                    () = cancel.cancelled() => {
+                        self.append_event(
+                            session_id,
+                            EventKind::TurnCancelled,
+                            json!({"turn_id": turn_id}),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                    item = stream.next() => {
+                        match item {
+                            None => break,
+                            Some(Ok(ChatEvent::Content { text })) => {
+                                total_tokens = total_tokens
+                                    .saturating_add(estimate_tokens(&text) as u64);
+                                content.push_str(&text);
+                                self.append_event(
+                                    session_id,
+                                    EventKind::ModelDelta,
+                                    json!({"turn_id": turn_id, "text": text}),
+                                )
+                                .await?;
+                            }
+                            Some(Ok(ChatEvent::Reasoning { text })) => {
+                                total_tokens = total_tokens
+                                    .saturating_add(estimate_tokens(&text) as u64);
+                                self.append_event(
+                                    session_id,
+                                    EventKind::ReasoningDelta,
+                                    json!({"turn_id": turn_id, "text": text}),
+                                )
+                                .await?;
+                            }
+                            Some(Ok(ChatEvent::ToolCallDelta {
+                                index,
+                                id,
+                                name,
+                                arguments,
+                            })) => {
+                                let accumulator = accumulators.entry(index).or_default();
+                                if let Some(id) = id {
+                                    accumulator.id = Some(id);
+                                }
+                                if let Some(name) = name {
+                                    accumulator.name = Some(name);
+                                }
+                                accumulator.arguments.push_str(&arguments);
+                            }
+                            Some(Ok(ChatEvent::Usage { usage: reported })) => {
+                                usage = reported;
+                                total_tokens = total_tokens.saturating_add(
+                                    reported.input_tokens + reported.output_tokens,
+                                );
+                            }
+                            Some(Ok(ChatEvent::Done)) => break,
+                            Some(Err(error)) => return Err(RuntimeError::Provider(error)),
+                        }
+                    }
+                }
+            }
+
+            total_usage.input_tokens = total_usage.input_tokens.saturating_add(usage.input_tokens);
+            total_usage.output_tokens = total_usage
+                .output_tokens
+                .saturating_add(usage.output_tokens);
+
+            if accumulators.is_empty() {
+                self.append_event(
+                    session_id,
+                    EventKind::TurnCompleted,
+                    json!({
+                        "turn_id": turn_id,
+                        "usage": {
+                            "input_tokens": total_usage.input_tokens,
+                            "output_tokens": total_usage.output_tokens
+                        }
+                    }),
+                )
+                .await?;
+                return Ok(());
+            }
+
+            let mut accumulators = accumulators.into_iter().collect::<Vec<_>>();
+            accumulators.sort_by_key(|(index, _)| *index);
+            let mut tool_calls = Vec::new();
+            for (index, accumulator) in accumulators {
+                let name = accumulator.name.ok_or_else(|| {
+                    RuntimeError::InvalidRequest(format!("tool call {index} has no name"))
+                })?;
+                let arguments = if accumulator.arguments.trim().is_empty() {
+                    "{}".to_owned()
+                } else {
+                    accumulator.arguments
+                };
+                tool_calls.push(ToolCall {
+                    id: accumulator.id.unwrap_or_else(|| self.ids.new_id("call")),
+                    name,
+                    arguments,
+                });
+            }
+
+            for call in &tool_calls {
+                self.append_event(
+                    session_id,
+                    EventKind::ToolCall,
+                    json!({
+                        "turn_id": turn_id,
+                        "id": call.id,
+                        "name": call.name,
+                        "arguments": call.arguments
+                    }),
+                )
+                .await?;
+            }
+
+            let assistant_content = if content.trim().is_empty() {
+                None
+            } else {
+                Some(content)
+            };
+            messages.push(ChatMessage::assistant(
+                assistant_content,
+                tool_calls.clone(),
+            ));
+
+            let mut prepared = Vec::new();
+            for call in tool_calls {
+                if cancel.is_cancelled() {
                     self.append_event(
                         session_id,
                         EventKind::TurnCancelled,
@@ -585,66 +803,142 @@ impl Runtime {
                     .await?;
                     return Ok(());
                 }
-                item = stream.next() => {
-                    match item {
-                        None => break,
-                        Some(Ok(ChatEvent::Content { text })) => {
-                            self.append_event(
-                                session_id,
-                                EventKind::ModelDelta,
-                                json!({"turn_id": turn_id, "text": text}),
-                            )
-                            .await?;
+
+                match serde_json::from_str::<Value>(&call.arguments) {
+                    Err(error) => prepared.push(PreparedTool::Result {
+                        call,
+                        result: ToolResult {
+                            content: format!("invalid JSON arguments: {error}"),
+                            is_error: true,
+                        },
+                    }),
+                    Ok(arguments) => match gate.check(&call.name, &arguments, tools.jail()) {
+                        PermissionDecision::Allow => {
+                            prepared.push(PreparedTool::Execute { call, arguments });
                         }
-                        Some(Ok(ChatEvent::Reasoning { text })) => {
-                            self.append_event(
-                                session_id,
-                                EventKind::ReasoningDelta,
-                                json!({"turn_id": turn_id, "text": text}),
-                            )
-                            .await?;
+                        PermissionDecision::Ask(reason) => {
+                            let decision = self
+                                .request_approval(
+                                    session_id,
+                                    json!({
+                                        "tool": call.name.clone(),
+                                        "arguments": arguments.clone(),
+                                        "reason": reason
+                                    }),
+                                )
+                                .await?;
+                            if decision == ApprovalDecision::Allow {
+                                prepared.push(PreparedTool::Execute { call, arguments });
+                            } else {
+                                prepared.push(PreparedTool::Result {
+                                    call,
+                                    result: ToolResult {
+                                        content: "denied by user".to_owned(),
+                                        is_error: true,
+                                    },
+                                });
+                            }
                         }
-                        Some(Ok(ChatEvent::ToolCallDelta {
-                            index,
-                            id,
-                            name,
-                            arguments,
-                        })) => {
-                            self.append_event(
-                                session_id,
-                                EventKind::ToolCall,
-                                json!({
-                                    "turn_id": turn_id,
-                                    "index": index,
-                                    "id": id,
-                                    "name": name,
-                                    "arguments": arguments
-                                }),
-                            )
-                            .await?;
-                        }
-                        Some(Ok(ChatEvent::Usage { usage: reported })) => {
-                            usage = reported;
-                        }
-                        Some(Ok(ChatEvent::Done)) => break,
-                        Some(Err(error)) => return Err(RuntimeError::Provider(error)),
-                    }
+                        PermissionDecision::Deny(reason) => prepared.push(PreparedTool::Result {
+                            call,
+                            result: ToolResult {
+                                content: format!("denied: {reason}"),
+                                is_error: true,
+                            },
+                        }),
+                    },
                 }
+            }
+
+            let mut tasks = Vec::new();
+            for (index, item) in prepared.iter().enumerate() {
+                if let PreparedTool::Execute { call, arguments } = item {
+                    let tools = Arc::clone(&tools);
+                    let name = call.name.clone();
+                    let args = arguments.clone();
+                    tasks.push((
+                        index,
+                        tokio::task::spawn_blocking(move || tools.execute(&name, args)),
+                    ));
+                }
+            }
+
+            let mut executed = HashMap::new();
+            for (index, task) in tasks {
+                let result = match task.await {
+                    Ok(result) => result,
+                    Err(error) => Err(ToolError::InvalidArgs(format!("tool task failed: {error}"))),
+                };
+                executed.insert(index, result);
+            }
+
+            if cancel.is_cancelled() {
+                self.append_event(
+                    session_id,
+                    EventKind::TurnCancelled,
+                    json!({"turn_id": turn_id}),
+                )
+                .await?;
+                return Ok(());
+            }
+
+            for (index, item) in prepared.into_iter().enumerate() {
+                let (call, result) = match item {
+                    PreparedTool::Result { call, result } => (call, result),
+                    PreparedTool::Execute { call, .. } => {
+                        let result = executed.remove(&index).unwrap_or_else(|| {
+                            Err(ToolError::InvalidArgs("missing tool result".to_owned()))
+                        });
+                        let result = match result {
+                            Ok(result) => result,
+                            Err(error) => ToolResult {
+                                content: error.to_string(),
+                                is_error: true,
+                            },
+                        };
+                        (call, result)
+                    }
+                };
+
+                total_tokens = total_tokens
+                    .saturating_add(estimate_tokens(&call.arguments) as u64)
+                    .saturating_add(estimate_tokens(&result.content) as u64);
+                self.append_event(
+                    session_id,
+                    EventKind::ToolResult,
+                    json!({
+                        "turn_id": turn_id,
+                        "tool_call_id": call.id,
+                        "name": call.name,
+                        "content": result.content,
+                        "is_error": result.is_error
+                    }),
+                )
+                .await?;
+
+                let tool_content = if result.is_error {
+                    format!("[error] {}", result.content)
+                } else {
+                    result.content
+                };
+                messages.push(ChatMessage::tool(call.id, tool_content));
             }
         }
 
-        self.append_event(
-            session_id,
-            EventKind::TurnCompleted,
-            json!({
-                "turn_id": turn_id,
-                "usage": {
-                    "input_tokens": usage.input_tokens,
-                    "output_tokens": usage.output_tokens
-                }
-            }),
-        )
-        .await?;
-        Ok(())
+        Err(RuntimeError::InvalidRequest(
+            "tool iteration budget exhausted".to_owned(),
+        ))
     }
+}
+
+#[derive(Default)]
+struct ToolAccumulator {
+    id: Option<String>,
+    name: Option<String>,
+    arguments: String,
+}
+
+enum PreparedTool {
+    Execute { call: ToolCall, arguments: Value },
+    Result { call: ToolCall, result: ToolResult },
 }

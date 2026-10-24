@@ -91,8 +91,8 @@ Event kinds in v1:
 | `turn_started` | `turn_id`, `input` |
 | `model_delta` | `turn_id`, `text` |
 | `reasoning_delta` | `turn_id`, `text` |
-| `tool_call` | `turn_id`, `index`, `id`, `name`, `arguments` |
-| `tool_result` | tool-specific |
+| `tool_call` | `turn_id`, `id`, `name`, `arguments` |
+| `tool_result` | `turn_id`, `tool_call_id`, `name`, `content`, `is_error` |
 | `permission_requested` | `approval_id`, `action` |
 | `permission_resolved` | `approval_id`, `decision` |
 | `turn_completed` | `turn_id`, `usage.input_tokens`, `usage.output_tokens` |

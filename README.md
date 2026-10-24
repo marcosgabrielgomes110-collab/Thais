@@ -297,6 +297,23 @@ The wire protocol is documented in [docs/protocol.md](docs/protocol.md). The
 M0 rollback spike is documented in
 [docs/spikes/rollback.md](docs/spikes/rollback.md).
 
+### Real provider and TUI (M1)
+
+The fake provider remains the default. The M1 real provider is Cohere through
+its OpenAI-compatible endpoint. The key is read from the environment and is
+never written to the repository or logs:
+
+```sh
+export THAIS_COHERE_API_KEY="..."
+thais run --provider cohere --task "Find where Runtime is defined and cite the file"
+thais tui --provider cohere
+```
+
+The TUI keys are: `Enter` send, `Esc` cancel the active turn (or quit when idle),
+`PageUp`/`PageDown` scroll, `Ctrl+C` quit, and `y`/`n` for approval prompts.
+The headless `thais run` command prints model text to stdout and logs to stderr;
+`--json` emits the NDJSON event stream.
+
 ## Out of scope
 
 This document defines behavior, not libraries. The implementation language is Rust and the storage engine is SQLite WAL + FTS5; the UI framework, provider SDK details, and deployment model remain implementation choices. Telemetry, a web UI, and automatic session expiry are out of scope for v1.

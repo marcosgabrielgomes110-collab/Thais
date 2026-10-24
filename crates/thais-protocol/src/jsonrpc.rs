@@ -8,7 +8,7 @@ use crate::JSONRPC_VERSION;
 use crate::error::{ErrorObject, ProtocolError};
 
 /// JSON-RPC request identifier.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Id {
     /// Numeric identifier.

@@ -1,6 +1,8 @@
 //! Deterministic fake provider used by M0 tests and `thais run --fake`.
 
+use std::collections::VecDeque;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use futures_util::stream::BoxStream;
@@ -43,6 +45,20 @@ pub enum FakeStep {
         #[serde(default)]
         output_tokens: u64,
     },
+    /// Emit a complete tool-call delta.
+    ToolCall {
+        /// Tool-call index.
+        #[serde(default)]
+        index: usize,
+        /// Tool-call identifier.
+        #[serde(default)]
+        id: String,
+        /// Tool name.
+        name: String,
+        /// JSON arguments.
+        #[serde(default)]
+        arguments: String,
+    },
     /// Wait before the next step.
     Delay {
         /// Duration in milliseconds.
@@ -75,21 +91,27 @@ impl FakeScript {
 pub struct FakeProvider {
     id: String,
     model: String,
-    script: FakeScript,
+    scripts: Arc<Mutex<VecDeque<FakeScript>>>,
 }
 
 impl FakeProvider {
-    /// Build a fake provider from a script.
+    /// Build a fake provider from one script.
     #[must_use]
     pub fn new(id: impl Into<String>, script: FakeScript) -> Self {
-        let model = script
-            .model
-            .clone()
+        Self::with_scripts(id, vec![script])
+    }
+
+    /// Build a fake provider from a queue of scripts, one per chat call.
+    #[must_use]
+    pub fn with_scripts(id: impl Into<String>, scripts: Vec<FakeScript>) -> Self {
+        let model = scripts
+            .first()
+            .and_then(|script| script.model.clone())
             .unwrap_or_else(|| "fake-model".to_owned());
         Self {
             id: id.into(),
             model,
-            script,
+            scripts: Arc::new(Mutex::new(scripts.into())),
         }
     }
 
@@ -121,7 +143,13 @@ impl Provider for FakeProvider {
         &self,
         _request: ChatRequest,
     ) -> Result<BoxStream<'static, Result<ChatEvent, ProviderError>>, ProviderError> {
-        let steps = self.script.steps.clone();
+        let steps = self
+            .scripts
+            .lock()
+            .map_err(|_| ProviderError::Message("fake provider lock poisoned".to_owned()))?
+            .pop_front()
+            .map(|script| script.steps)
+            .unwrap_or_default();
         let (sender, receiver) = mpsc::channel(8);
         tokio::spawn(async move {
             for step in steps {
@@ -136,6 +164,17 @@ impl Provider for FakeProvider {
                             input_tokens,
                             output_tokens,
                         },
+                    }),
+                    FakeStep::ToolCall {
+                        index,
+                        id,
+                        name,
+                        arguments,
+                    } => Ok(ChatEvent::ToolCallDelta {
+                        index,
+                        id: Some(id),
+                        name: Some(name),
+                        arguments,
                     }),
                     FakeStep::Delay { millis } => {
                         tokio::time::sleep(std::time::Duration::from_millis(millis)).await;

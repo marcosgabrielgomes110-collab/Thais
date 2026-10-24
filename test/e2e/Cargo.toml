@@ -11,6 +11,7 @@ thais-protocol = { version = "0.1.0", path = "../../crates/thais-protocol" }
 thais-providers = { version = "0.1.0", path = "../../crates/thais-providers" }
 thais-sdk = { version = "0.1.0", path = "../../crates/thais-sdk" }
 thais-storage = { version = "0.1.0", path = "../../crates/thais-storage" }
+futures-util.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 tokio.workspace = true

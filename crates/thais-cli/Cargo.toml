@@ -15,6 +15,7 @@ thais-protocol = { version = "0.1.0", path = "../thais-protocol" }
 thais-providers = { version = "0.1.0", path = "../thais-providers" }
 thais-sdk = { version = "0.1.0", path = "../thais-sdk" }
 thais-storage = { version = "0.1.0", path = "../thais-storage" }
+thais-tui = { version = "0.1.0", path = "../thais-tui" }
 anyhow.workspace = true
 clap.workspace = true
 serde_json.workspace = true

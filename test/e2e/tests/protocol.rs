@@ -38,6 +38,7 @@ impl Harness {
             provider,
             Arc::new(FixedClock::new("2026-10-23T00:00:00Z")),
             Arc::new(SequenceIdGenerator::new("t")),
+            thais_core::ContextManager::empty(),
         ));
 
         let (client, server) = tokio::io::duplex(64 * 1024);

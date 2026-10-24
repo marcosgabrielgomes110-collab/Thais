@@ -3,6 +3,8 @@
 //! Client SDK for the Thais Agent API. Clients depend on this crate and
 //! `thais-protocol`; they never import `thais-core`.
 
+pub mod channel;
+
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use async_trait::async_trait;
@@ -18,6 +20,7 @@ use thais_protocol::session::{
 };
 use thiserror::Error;
 
+pub use channel::{ClientTransport, ServerTransport, empty_notifications, pair};
 pub use thais_protocol as protocol;
 
 /// A bidirectional Agent API transport.
@@ -238,5 +241,54 @@ mod tests {
             .await
             .expect_err("error");
         assert!(matches!(error, SdkError::Remote { code: -32602, .. }));
+    }
+}
+
+#[cfg(test)]
+mod channel_tests {
+    use super::*;
+    use futures_util::StreamExt;
+    use thais_protocol::jsonrpc::{Message, Notification, Response};
+    use thais_protocol::method;
+
+    #[tokio::test]
+    async fn channel_transport_round_trips_responses_and_notifications() {
+        let (client, mut server) = channel::pair();
+        let notification = Notification::new(method::SESSION_EVENT, serde_json::json!({"seq": 1}));
+
+        let server_task = tokio::spawn(async move {
+            let request = server.recv().await.expect("request");
+            server
+                .send(Message::Response(Response::success(
+                    request.id,
+                    serde_json::json!({"ok": true}),
+                )))
+                .await
+                .expect("response");
+            server
+                .send(Message::Notification(notification))
+                .await
+                .expect("notification");
+        });
+
+        let mut notifications = client.notifications();
+        let response = client
+            .request(thais_protocol::jsonrpc::Request::new(
+                1_i64,
+                method::INITIALIZE,
+                serde_json::json!({}),
+            ))
+            .await
+            .expect("request");
+        assert_eq!(response.result.expect("result")["ok"], true);
+
+        let received =
+            tokio::time::timeout(std::time::Duration::from_secs(2), notifications.next())
+                .await
+                .expect("notification timeout")
+                .expect("notification");
+        assert_eq!(received.method, method::SESSION_EVENT);
+
+        server_task.await.expect("server task");
     }
 }
