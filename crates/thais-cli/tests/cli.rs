@@ -10,7 +10,12 @@ fn binary() -> std::path::PathBuf {
 }
 
 fn with_xdg(command: &mut Command, root: &Path) {
+    let home = root.join("home");
     command
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("APPDATA", home.join("AppData/Roaming"))
+        .env("LOCALAPPDATA", home.join("AppData/Local"))
         .env("XDG_CONFIG_HOME", root.join("config"))
         .env("XDG_DATA_HOME", root.join("data"))
         .env("XDG_STATE_HOME", root.join("state"))
