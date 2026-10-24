@@ -423,7 +423,7 @@ M3 can run in parallel with M2 after M1. The critical path is M0 → M1 → M2 �
 |---|---|---|
 | M0 Foundation | Done | 2–3 weeks |
 | M1 Read-only agent | Done | 3–5 weeks |
-| M2 Safe build | In progress | 5–7 weeks |
+| M2 Safe build | Done | 5–7 weeks |
 | Alpha: M0 + M1 + M2 + simple checkpoint | Planned | 12–18 weeks cumulative |
 | M3 Sessions and models | Planned | 4–6 weeks |
 | M4 Memory and continuity | Planned | 3–5 weeks |
@@ -436,9 +436,9 @@ Estimates assume one developer with systems experience but new to Rust and this 
 
 ## Current focus
 
-**M2 — Safe build.** M1 is implemented and the read-only loop is in place. M2 adds write/edit/patch, bash, git read tools, shadow-Git snapshots, rollback, verifier, plan approval, and diff approvals. Do not call M2 done until its acceptance criteria pass; M3 can run in parallel after M1.
+**Alpha — Daily-use feedback release.** M0, M1, and M2 are done and tagged (`v0.2.0-m1`, `v0.3.0-m2`). Alpha adds the simple checkpoint and manual resume. M3 can run in parallel, but the critical path is Alpha feedback before M4.
 
-Alpha is the first daily-use release: M0 + M1 + M2 + a simple checkpoint. The next gate after M2 is Alpha feedback.
+Alpha is the first daily-use release: M0 + M1 + M2 + a simple checkpoint. The next gate is a developer using Alpha on a real repository for a week without losing work.
 
 ## Milestones
 
@@ -887,3 +887,4 @@ There are no open v1 decisions. The next decision that needs a choice gets a new
 | 2026-10-23 | Implemented the M1 read-only loop: Cohere/OpenAI-compatible provider, context manager, environment badge, AGENTS.md, read tools, gate, parallel tool execution, TUI, and budgets |
 | 2026-10-23 | Implemented the M2 build loop: write/edit/apply_patch, bash, git read tools, shadow-Git snapshots, rollback, verifier, plan approval, diff previews, personality file, and audit events |
 | 2026-10-23 | M1 accepted by CI; M2 implementation started |
+| 2026-10-23 | M2 accepted by CI on Linux/macOS, Windows check, and audit; tagged `v0.3.0-m2`; M1 tagged `v0.2.0-m1` |
