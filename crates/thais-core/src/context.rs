@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use thais_storage::Paths;
+use thais_storage::{BasicRedactor, Paths, Redactor};
 use thiserror::Error;
 
 use crate::env_badge::EnvironmentBadge;
@@ -67,6 +67,8 @@ impl ContextManager {
             None => None,
         };
         let project = read_optional(&workspace.join("AGENTS.md"), self.max_agents_chars)?;
+        let global = global.map(redact_text);
+        let project = project.map(redact_text);
 
         let mut system = String::new();
         system.push_str("## Safety\n");
@@ -78,7 +80,7 @@ impl ContextManager {
         system.push_str("\n\n## Project instructions (override global, never safety)\n");
         system.push_str(project.as_deref().unwrap_or("(none)"));
 
-        let user = user_input.trim().to_owned();
+        let user = redact_text(user_input.trim().to_owned());
         let mut estimated_tokens = estimate_tokens(&system) + estimate_tokens(&user);
         if estimated_tokens > self.max_system_tokens {
             let max_chars = self.max_system_tokens.saturating_mul(4);
@@ -130,6 +132,11 @@ fn read_optional(path: &Path, max_chars: usize) -> Result<Option<String>, Contex
 
 fn truncate_chars(text: &str, max_chars: usize) -> String {
     text.chars().take(max_chars).collect()
+}
+
+fn redact_text(mut text: String) -> String {
+    BasicRedactor.redact_text(&mut text);
+    text
 }
 
 /// Cheap token estimate. M1 does not ship a tokenizer; a provider-agnostic
@@ -197,6 +204,27 @@ mod tests {
             .expect("bundle");
         assert!(bundle.system.contains("[truncated]"));
         assert!(bundle.system.chars().count() < large.chars().count());
+    }
+
+    #[tokio::test]
+    async fn secrets_are_redacted_from_instructions_and_user_input() {
+        let temp = tempfile::tempdir().expect("temp");
+        let paths = paths(temp.path());
+        paths.ensure().expect("ensure");
+        std::fs::write(paths.config_file("AGENTS.md"), "token sk-live-123").expect("global");
+        let workspace = temp.path().join("repo");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        std::fs::write(workspace.join("AGENTS.md"), "project ghp_deadbeef").expect("project");
+
+        let bundle = ContextManager::new(paths)
+            .build(&workspace, "use sk-input-secret")
+            .await
+            .expect("bundle");
+        assert!(!bundle.system.contains("sk-live-123"));
+        assert!(!bundle.system.contains("ghp_deadbeef"));
+        assert!(!bundle.user.contains("sk-input-secret"));
+        assert!(bundle.system.contains("[REDACTED]"));
+        assert!(bundle.user.contains("[REDACTED]"));
     }
 
     #[test]
