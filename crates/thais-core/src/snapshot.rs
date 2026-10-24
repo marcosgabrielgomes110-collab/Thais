@@ -38,7 +38,7 @@ impl SnapshotManager {
                 .arg(&git_dir)
                 .status()
                 .map_err(|error| SnapshotError::Git(format!("git init: {error}")))?;
-            if !status.success() {
+            if !status.success() && !git_dir.join("HEAD").exists() {
                 return Err(SnapshotError::Git("git init failed".to_owned()));
             }
         }

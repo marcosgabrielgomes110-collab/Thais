@@ -2,6 +2,7 @@
 //! approvals and cancellations.
 
 use std::collections::{BTreeMap, HashMap};
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -423,10 +424,11 @@ impl Runtime {
             SessionMode::Plan => PolicyMode::Plan,
             SessionMode::Build => PolicyMode::Build,
         });
-        let snapshot_root = self
-            .snapshot_base
-            .clone()
-            .unwrap_or_else(|| std::env::temp_dir().join("thais-snapshots"));
+        let snapshot_root = self.snapshot_base.clone().unwrap_or_else(|| {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            info.workspace.hash(&mut hasher);
+            std::env::temp_dir().join(format!("thais-snapshots-{:016x}", hasher.finish()))
+        });
         let snapshots = SnapshotManager::new(
             Path::new(&info.workspace),
             &snapshot_root.join(&info.session_id),
