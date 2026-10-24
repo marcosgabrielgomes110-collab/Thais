@@ -9,6 +9,7 @@ use wait_timeout::ChildExt;
 
 use crate::error::ToolError;
 use crate::path_jail::PathJail;
+use crate::sandbox::Sandbox;
 use crate::tools::{Tool, ToolDefinition, ToolResult, cap_output, metadata, required_str};
 
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
@@ -17,14 +18,38 @@ const MAX_STREAM_BYTES: usize = 100_000;
 
 /// Execute a shell command in the workspace. The gate must ask before this
 /// tool can run.
-pub struct BashTool;
+pub struct BashTool {
+    sandbox: Sandbox,
+}
+
+impl BashTool {
+    /// Build a bash tool with auto-detected sandbox settings.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            sandbox: Sandbox::from_env(),
+        }
+    }
+
+    /// Build a bash tool with an explicit sandbox policy.
+    #[must_use]
+    pub fn with_sandbox(sandbox: Sandbox) -> Self {
+        Self { sandbox }
+    }
+}
+
+impl Default for BashTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl Tool for BashTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "bash".to_owned(),
             description:
-                "Run a shell command in the workspace. Every call requires approval until M6."
+                "Run a shell command in the workspace. Every call requires approval. A best-effort OS sandbox is used when available."
                     .to_owned(),
             parameters: json!({
                 "type": "object",
@@ -63,7 +88,10 @@ impl Tool for BashTool {
             .unwrap_or(DEFAULT_TIMEOUT_MS)
             .clamp(100, MAX_TIMEOUT_MS);
 
-        let mut process = shell_command(command);
+        let mut process = self
+            .sandbox
+            .command(command, jail.root(), &cwd)
+            .map_err(ToolError::Command)?;
         process
             .current_dir(&cwd)
             .stdin(Stdio::null())
@@ -131,21 +159,6 @@ impl Tool for BashTool {
         }
 
         Ok(ToolResult::ok(cap_output(content)))
-    }
-}
-
-fn shell_command(command: &str) -> Command {
-    #[cfg(windows)]
-    {
-        let mut process = Command::new("cmd");
-        process.arg("/C").arg(command);
-        process
-    }
-    #[cfg(not(windows))]
-    {
-        let mut process = Command::new("/bin/sh");
-        process.arg("-c").arg(command);
-        process
     }
 }
 

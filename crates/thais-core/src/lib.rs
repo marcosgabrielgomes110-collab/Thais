@@ -26,7 +26,7 @@ pub use replay::{ReplayError, ReplayState, replay_session};
 pub use runtime::{RequestOutcome, Runtime, RuntimeError};
 pub use server::{ServerError, serve, serve_stdio};
 pub use snapshot::{Snapshot, SnapshotError, SnapshotManager};
-pub use thais_tools::{LspConfig, McpConfig};
+pub use thais_tools::{LspConfig, McpConfig, Sandbox, SandboxBackend, SandboxMode};
 pub use verifier::{Verification, Verifier, VerifierError};
 
 /// Version of the core crate.

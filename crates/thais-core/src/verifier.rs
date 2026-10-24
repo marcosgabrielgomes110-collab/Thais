@@ -90,7 +90,7 @@ impl Verifier {
             }
         };
         let timeout_ms = self.timeout.as_millis().min(120_000) as u64;
-        let tool = BashTool;
+        let tool = BashTool::new();
         let mut output = String::new();
         for command in &self.commands {
             let result =

@@ -1836,3 +1836,62 @@ timeout_ms = 2000
             .any(|event| event.kind == EventKind::LspDiagnostics)
     );
 }
+
+#[tokio::test]
+async fn tool_output_is_redacted_before_the_model_and_event_log() {
+    let temp = tempfile::tempdir().expect("temp");
+    let runtime = runtime_with_scripts(
+        &temp,
+        vec![
+            script(vec![FakeStep::ToolCall {
+                index: 0,
+                id: "call_secret".to_owned(),
+                name: "bash".to_owned(),
+                arguments: json!({"command": "printf sk-live-secret-123"}).to_string(),
+            }]),
+            script(vec![FakeStep::Text {
+                text: "done".to_owned(),
+            }]),
+        ],
+    );
+    let session = runtime
+        .create_session(
+            temp.path().to_string_lossy().into_owned(),
+            SessionMode::Build,
+            None,
+        )
+        .await
+        .expect("create");
+    let mut live = runtime.subscribe_live();
+    runtime
+        .send(&session.session_id, "run".to_owned(), None)
+        .await
+        .expect("send");
+    tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            let event = live.recv().await.expect("event");
+            if event.kind == EventKind::PermissionRequested {
+                runtime
+                    .approve(
+                        &event.session_id,
+                        event.payload["approval_id"].as_str().expect("approval id"),
+                        ApprovalDecision::Allow,
+                    )
+                    .await
+                    .expect("approve");
+            }
+            if event.session_id == session.session_id && event.kind == EventKind::TurnCompleted {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("turn");
+    let replay = runtime
+        .replay_session(&session.session_id)
+        .await
+        .expect("replay");
+    let encoded = serde_json::to_string(&replay.events).expect("json");
+    assert!(!encoded.contains("sk-live-secret-123"), "{encoded}");
+    assert!(encoded.contains("[REDACTED]"));
+}

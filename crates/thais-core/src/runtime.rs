@@ -29,7 +29,7 @@ use thais_protocol::session::{
 use thais_providers::{
     ChatEvent, ChatMessage, ChatRequest, Provider, ToolCall, ToolDefinition, Usage,
 };
-use thais_storage::{NewEvent, StorageError, StorageHandle};
+use thais_storage::{BasicRedactor, NewEvent, Redactor, StorageError, StorageHandle};
 use thais_tools::{
     LspConfig, McpConfig, PermissionDecision, PermissionGate, PolicyMode, ToolError, ToolRegistry,
     ToolResult,
@@ -1840,6 +1840,7 @@ impl Runtime {
                 }
                 let result = tools
                     .execute(&call.name, arguments.clone())
+                    .map(redact_tool_result)
                     .map_err(|error| ToolError::Command(error.to_string()))?;
                 if snapshot.is_some()
                     && let Some(verifier) = &self.verifier
@@ -2519,7 +2520,8 @@ impl Runtime {
 
             for (index, task) in tasks {
                 let result = match task.await {
-                    Ok(result) => result,
+                    Ok(Ok(result)) => Ok(redact_tool_result(result)),
+                    Ok(Err(error)) => Err(error),
                     Err(error) => Err(ToolError::InvalidArgs(format!("tool task failed: {error}"))),
                 };
                 executed.insert(index, result);
@@ -2563,7 +2565,9 @@ impl Runtime {
                     }
                 };
 
-                let result = tools.execute(&call.name, arguments.clone());
+                let result = tools
+                    .execute(&call.name, arguments.clone())
+                    .map(redact_tool_result);
                 if cancel.is_cancelled() {
                     let restored = snapshots.restore(&snapshot).unwrap_or_default();
                     self.append_event(
@@ -2783,6 +2787,15 @@ struct ToolAccumulator {
 enum PreparedTool {
     Execute { call: ToolCall, arguments: Value },
     Result { call: ToolCall, result: ToolResult },
+}
+
+fn redact_tool_result(mut result: ToolResult) -> ToolResult {
+    let redactor = BasicRedactor;
+    redactor.redact_text(&mut result.content);
+    if let Some(diff) = result.diff.as_mut() {
+        redactor.redact_text(diff);
+    }
+    result
 }
 
 fn derive_tasks(plan: &str) -> Vec<String> {

@@ -825,6 +825,16 @@ fn doctor() -> anyhow::Result<()> {
     println!("data:   {}", paths.data_dir().display());
     println!("state:  {}", paths.state_dir().display());
     println!("cache:  {}", paths.cache_dir().display());
+    let sandbox = thais_core::Sandbox::from_env();
+    println!(
+        "[info] sandbox: {} ({:?})",
+        if sandbox.is_active() {
+            "active"
+        } else {
+            "unavailable"
+        },
+        sandbox.backend()
+    );
 
     if let Err(error) = paths.ensure() {
         println!("[fail] could not create user directories: {error}");

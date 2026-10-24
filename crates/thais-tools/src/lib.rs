@@ -11,6 +11,7 @@ pub mod memory;
 pub mod mutating;
 pub mod path_jail;
 pub mod permission;
+pub mod sandbox;
 pub mod subagent;
 pub mod tools;
 
@@ -23,6 +24,7 @@ pub use memory::{MEMORY_FILE, MemoryWriteTool};
 pub use mutating::{ApplyPatchTool, EditTool, WriteTool};
 pub use path_jail::PathJail;
 pub use permission::{PermissionDecision, PermissionGate, PolicyMode};
+pub use sandbox::{Sandbox, SandboxBackend, SandboxMode};
 pub use subagent::SubagentTool;
 pub use tools::{Tool, ToolDefinition, ToolRegistry, ToolResult};
 

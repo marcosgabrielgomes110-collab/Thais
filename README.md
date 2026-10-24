@@ -16,7 +16,7 @@
   <img src="https://img.shields.io/badge/rust-1.99.1-b7410e?logo=rust&logoColor=white" alt="Rust 1.99.1" />
   <img src="https://img.shields.io/badge/local--first-yes-2f6f5e" alt="Local-first" />
   <img src="https://img.shields.io/badge/telemetry-none-2f6f5e" alt="No telemetry" />
-  <img src="https://img.shields.io/badge/status-M5-6f42c1" alt="M5" />
+  <img src="https://img.shields.io/badge/status-M6%20in%20progress-6f42c1" alt="M6 in progress" />
 </p>
 
 ---
@@ -255,7 +255,7 @@ thais lease release --workspace .
 
 - O gate decide `allow`, `ask` ou `deny` para toda ação.
 - Plan mode é read-only; aprovação do plano é a única entrada em build mode.
-- `bash` é sempre `ask` até o M6. O path jail **não** é um sandbox de SO.
+- `bash` continua `ask`; sandbox ativo não remove a aprovação nesta fase. O path jail **não** é um sandbox de SO.
 - Mutações têm snapshot e rollback; o Verifier cobre apenas mudanças de código.
 - Segredos são redigidos antes do log, do índice e do prompt.
 - Config de projeto é não confiável e não pode definir providers, auth,
@@ -273,10 +273,34 @@ thais lease release --workspace .
 | M4 — Memory and continuity | Done | `v0.5.0-m4` |
 | M5 — Tool ecosystem | Done | `v0.6.0-m5` |
 | Alpha | Feedback gate | em uso real |
-| M6 — Hardening | Próximo | sandbox, PTY, cross-platform |
+| M6 — Hardening | Em andamento | sandbox, PTY, cross-platform |
 
-O Alpha continua sendo o gate de feedback em repositório real. O próximo marco
-numerado é o **M6 — Hardening**.
+O Alpha continua sendo o gate de feedback em repositório real. O **M6** está
+em andamento: a primeira camada já está no `main`, mas o marco ainda não foi
+fechado.
+
+### M6 hardening — em andamento
+
+Já implementado:
+
+- Detecção automática de sandbox de processo:
+  - Linux: `bwrap` (bubblewrap), com `--unshare-all`
+  - macOS: `sandbox-exec`
+  - fallback para execução não isolada, mantendo `bash` em `ask`
+- `THAIS_SANDBOX=auto|off|required`; `required` recusa executar sem backend.
+- Status do backend no `thais doctor`.
+- Redaction de tool output e diffs antes de irem para o modelo e para o Event Log.
+- Expansão dos padrões de segredo no redactor.
+- Testes de redaction de tool output e de fallback de sandbox.
+
+Ainda falta para fechar o M6:
+
+- Landlock/seccomp no Linux, Seatbelt completo no macOS e Job Objects no Windows.
+- PTY/ConPTY com `portable-pty`.
+- Matriz de testes Windows, fuzzing de protocolo e testes de concorrência.
+- Testes completos de prompt injection e vazamento de ambiente.
+- Recuperação de crash com retries idempotentes.
+- Pass de performance de contexto, SQLite, eventos e TUI.
 
 ## Documentação
 

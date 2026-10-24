@@ -138,7 +138,9 @@ impl ToolRegistry {
         registry
             .tools
             .insert("apply_patch".to_owned(), Arc::new(ApplyPatchTool));
-        registry.tools.insert("bash".to_owned(), Arc::new(BashTool));
+        registry
+            .tools
+            .insert("bash".to_owned(), Arc::new(BashTool::new()));
         registry
             .tools
             .insert("git_commit".to_owned(), Arc::new(GitCommitTool));

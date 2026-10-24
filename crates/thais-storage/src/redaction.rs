@@ -73,9 +73,19 @@ const TOKEN_PREFIXES: &[&str] = &[
     "github_pat_",
     "xoxb-",
     "xoxp-",
+    "xoxa-",
+    "xoxr-",
+    "gho_",
+    "ghu_",
+    "ghs_",
+    "ghr_",
     "AKIA",
+    "ASIA",
     "AIza",
+    "ya29.",
+    "eyJ",
     "Bearer ",
+    "-----BEGIN ",
 ];
 
 fn is_sensitive_key(key: &str) -> bool {
@@ -149,12 +159,15 @@ mod tests {
 
     #[test]
     fn redacts_common_token_prefixes_in_text() {
-        let text = "use sk-abc123 and ghp_deadbeef plus AKIA1234567890";
+        let text = "use sk-abc123 and ghp_deadbeef plus AKIA1234567890 Bearer abc.def AIzaSyDummy eyJhbGciOi";
         let redacted = redact_text_value(text);
         assert!(!redacted.contains("sk-abc123"));
         assert!(!redacted.contains("ghp_deadbeef"));
         assert!(!redacted.contains("AKIA1234567890"));
-        assert_eq!(redacted.matches("[REDACTED]").count(), 3);
+        assert!(!redacted.contains("abc.def"));
+        assert!(!redacted.contains("AIzaSyDummy"));
+        assert!(!redacted.contains("eyJhbGciOi"));
+        assert_eq!(redacted.matches("[REDACTED]").count(), 6);
     }
 
     #[test]
