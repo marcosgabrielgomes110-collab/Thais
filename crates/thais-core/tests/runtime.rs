@@ -1910,7 +1910,7 @@ async fn crashed_lease_can_be_released_before_recovery() {
     let storage =
         thais_storage::StorageHandle::open(temp.path().join("thais.db")).expect("storage");
     storage
-        .release_lease(workspace.clone(), session.session_id.clone())
+        .release_lease(session.workspace.clone(), session.session_id.clone())
         .await
         .expect("release crashed owner");
     let second = runtime_with_prefix(&temp, script(vec![]), "z");
