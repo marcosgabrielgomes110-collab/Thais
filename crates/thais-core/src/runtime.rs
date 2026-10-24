@@ -32,6 +32,7 @@ use tokio_util::sync::CancellationToken;
 use crate::clock::Clock;
 use crate::context::{ContextError, ContextManager, estimate_tokens};
 use crate::ids::IdGenerator;
+use crate::replay::{ReplayError, ReplayState};
 
 const MAX_TOOL_ITERATIONS: usize = 8;
 const MAX_TURN_TOKENS: u64 = 50_000;
@@ -68,6 +69,9 @@ pub enum RuntimeError {
     /// Tool execution failure.
     #[error("tool error: {0}")]
     Tool(#[from] ToolError),
+    /// Replay failure.
+    #[error("replay error: {0}")]
+    Replay(#[from] ReplayError),
 }
 
 impl RuntimeError {
@@ -78,9 +82,11 @@ impl RuntimeError {
             | Self::ApprovalNotFound(_)
             | Self::InvalidRequest(_)
             | Self::InvalidWorkspace => INVALID_PARAMS,
-            Self::Storage(_) | Self::Provider(_) | Self::Context(_) | Self::Tool(_) => {
-                INTERNAL_ERROR
-            }
+            Self::Storage(_)
+            | Self::Provider(_)
+            | Self::Context(_)
+            | Self::Tool(_)
+            | Self::Replay(_) => INTERNAL_ERROR,
         };
         ErrorObject::new(code, self.to_string())
     }
@@ -236,6 +242,11 @@ impl Runtime {
     /// List session metadata.
     pub async fn list_sessions(&self) -> Result<Vec<SessionInfo>, RuntimeError> {
         Ok(self.storage.list_sessions().await?)
+    }
+
+    /// Rebuild a session view from the Event Log.
+    pub async fn replay_session(&self, session_id: &str) -> Result<ReplayState, RuntimeError> {
+        Ok(crate::replay::replay_session(&self.storage, session_id).await?)
     }
 
     /// Start a turn. The turn runs in a background task and emits events.

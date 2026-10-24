@@ -552,3 +552,30 @@ async fn sensitive_read_is_denied_by_the_user_and_logged() {
     .await
     .expect("turn completed");
 }
+
+#[tokio::test]
+async fn replay_reconstructs_the_transcript_from_the_event_log() {
+    let temp = tempfile::tempdir().expect("temp");
+    let runtime = runtime(
+        &temp,
+        script(vec![FakeStep::Text {
+            text: "replayed hello".to_owned(),
+        }]),
+    );
+    let (session, _, events) = runtime
+        .run_once(
+            temp.path().to_string_lossy().into_owned(),
+            "hello".to_owned(),
+            None,
+        )
+        .await
+        .expect("run");
+
+    let replay = runtime
+        .replay_session(&session.session_id)
+        .await
+        .expect("replay");
+    assert_eq!(replay.transcript, "replayed hello");
+    assert_eq!(replay.last_seq, events.last().expect("last").seq);
+    assert_eq!(replay.events.len(), events.len());
+}
