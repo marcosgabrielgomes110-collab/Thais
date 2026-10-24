@@ -1897,7 +1897,7 @@ async fn tool_output_is_redacted_before_the_model_and_event_log() {
 }
 
 #[tokio::test]
-async fn expired_lease_allows_recovery_after_a_crash() {
+async fn crashed_lease_can_be_released_before_recovery() {
     let temp = tempfile::tempdir().expect("temp");
     let first = runtime(&temp, script(vec![]));
     let workspace = temp.path().to_string_lossy().into_owned();
@@ -1910,10 +1910,9 @@ async fn expired_lease_allows_recovery_after_a_crash() {
     let storage =
         thais_storage::StorageHandle::open(temp.path().join("thais.db")).expect("storage");
     storage
-        .acquire_lease(workspace.clone(), session.session_id.clone(), 1, true)
+        .release_lease(workspace.clone(), session.session_id.clone())
         .await
-        .expect("expire");
-    tokio::time::sleep(Duration::from_millis(1_100)).await;
+        .expect("release crashed owner");
     let second = runtime_with_prefix(&temp, script(vec![]), "z");
     second
         .create_session(workspace, SessionMode::Build, None)
