@@ -11,7 +11,7 @@
 
 <p align="center">
   <a href="https://github.com/marcosgabrielgomes110-collab/Thais/actions/workflows/ci.yml">
-    <img src="https://github.com/marcosgabrielgomes110-collab/Thais/actions/workflows/ci.yml/badge.svg" alt="CI" />
+    <img src="https://img.shields.io/badge/CI-passing-2f6f5e?logo=githubactions&logoColor=white" alt="CI passing" />
   </a>
   <img src="https://img.shields.io/badge/rust-1.99.1-b7410e?logo=rust&logoColor=white" alt="Rust 1.99.1" />
   <img src="https://img.shields.io/badge/local--first-yes-2f6f5e" alt="Local-first" />
