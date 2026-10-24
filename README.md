@@ -283,6 +283,7 @@ The workspace is a Rust workspace with a single `thais` binary and a
 | `make` | Setup, check, and release build |
 | `make check` | Format check, clippy, tests, and the architecture boundary |
 | `make run ARGS="run --task hello"` | Run the fake-provider M0 flow |
+| `make tui PROVIDER=cohere` | Open the TUI with the real Cohere provider (`make tui cohere` also works) |
 | `make run ARGS="doctor"` | Validate paths, permissions, keyring, and FTS5 |
 | `make tools` | Install `cargo-nextest`, `cargo-audit`, and `cargo-deny` |
 | `make install PREFIX=...` | Install the binary; `make uninstall` removes only the binary |

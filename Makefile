@@ -7,8 +7,19 @@ BINDIR ?= $(PREFIX)/bin
 ARGS ?=
 TARGET ?= target/release/$(BIN)
 DIST_DIR ?= dist
+PROVIDER ?= $(if $(filter cohere,$(MAKECMDGOALS)),cohere,fake)
+MODEL ?=
+WORKSPACE ?=
 
-.PHONY: all setup tools check fmt fmt-check lint test boundary build run install uninstall clean ci audit doctor help
+TUI_ARGS := --provider $(PROVIDER)
+ifneq ($(MODEL),)
+TUI_ARGS += --model "$(MODEL)"
+endif
+ifneq ($(WORKSPACE),)
+TUI_ARGS += --workspace "$(WORKSPACE)"
+endif
+
+.PHONY: all setup tools check fmt fmt-check lint test boundary build run tui fake cohere install uninstall clean ci audit doctor help
 
 all: setup check build
 
@@ -59,6 +70,13 @@ build:
 run:
 	cargo run -p thais-cli -- $(ARGS)
 
+tui:
+	cargo run -p thais-cli -- tui $(TUI_ARGS)
+
+# Shorthand goals for `make tui cohere` / `make tui fake`.
+fake cohere:
+	@:
+
 install: build
 	mkdir -p "$(BINDIR)"
 	install -m 0755 "$(TARGET)" "$(BINDIR)/$(BIN)"
@@ -97,6 +115,10 @@ help:
 		'  make boundary     fail if thais-tui depends on thais-core' \
 		'  make build        release build' \
 		'  make run          run with ARGS="..."' \
+		'  make tui          run the TUI (PROVIDER=fake by default)' \
+		'  make tui PROVIDER=cohere   run the TUI with Cohere' \
+		'  make tui cohere            shorthand for the same' \
+		'  make tui PROVIDER=cohere MODEL=command-a-plus-05-2026 WORKSPACE=.' \
 		'  make install      install to $(BINDIR)' \
 		'  make uninstall    remove the installed binary' \
 		'  make clean        remove build output' \
