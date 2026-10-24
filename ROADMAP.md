@@ -421,7 +421,7 @@ M3 can run in parallel with M2 after M1. The critical path is M0 → M1 → M2 �
 
 | Milestone | Status | Indicative effort |
 |---|---|---|
-| M0 Foundation | In progress | 2–3 weeks |
+| M0 Foundation | Done | 2–3 weeks |
 | M1 Read-only agent | Planned | 3–5 weeks |
 | M2 Safe build | Planned | 5–7 weeks |
 | Alpha: M0 + M1 + M2 + simple checkpoint | Planned | 12–18 weeks cumulative |
@@ -436,9 +436,9 @@ Estimates assume one developer with systems experience but new to Rust and this 
 
 ## Current focus
 
-**M0 — Foundation → Alpha.** Do not start M1 until the protocol handshake, event log, fake provider, and architecture boundary tests pass. The v1 decision set is closed; see [Decisions](#decisions). The M0 workspace, protocol, storage, fake runtime, CLI, and test harness are implemented; `make ci` is the gate.
+**M1 — Read-only agent.** M0 is done and tagged `v0.1.0-m0` (CI: Linux, macOS, Windows check, audit). M1 is the next gate: explore a repository, ask for permission, and stream a grounded answer without writing files. Do not start M2 until the M1 acceptance criteria pass.
 
-Alpha is the first daily-use release: M0 + M1 + M2 + a simple checkpoint. The next gate is Alpha feedback, not the full v1.
+Alpha is the first daily-use release: M0 + M1 + M2 + a simple checkpoint. The next gate after M1 is M2, then Alpha feedback.
 
 ## Milestones
 
@@ -883,3 +883,4 @@ There are no open v1 decisions. The next decision that needs a choice gets a new
 | 2026-10-23 | Unified Event Log and FTS5 in `thais.db`; `events` is append-only with triggers |
 | 2026-10-23 | Closed all open decisions; added ADRs and aligned scope, providers, second client, retention, telemetry, sandbox, and TUI tables |
 | 2026-10-23 | Implemented the M0 foundation: workspace, protocol v1, storage, credentials, fake runtime, CLI, tests, protocol docs, rollback spike, and CI |
+| 2026-10-23 | M0 accepted by CI on Linux/macOS, Windows check, and audit; tagged `v0.1.0-m0` |
