@@ -3,10 +3,12 @@
 //! Provider adapter layer. M0 ships the trait and a fake provider; native
 //! adapters arrive in M3.
 
+pub mod anthropic;
 pub mod fake;
 pub mod openai_compatible;
 pub mod provider;
 
+pub use anthropic::AnthropicProvider;
 pub use fake::{FakeProvider, FakeProviderError, FakeScript, FakeStep};
 pub use openai_compatible::{COHERE_BASE_URL, COHERE_DEFAULT_MODEL, OpenAiCompatibleProvider};
 pub use provider::{

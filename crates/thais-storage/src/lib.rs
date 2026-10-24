@@ -16,7 +16,7 @@ pub use credentials::{
 pub use paths::{PathError, Paths, ProjectPaths, write_private};
 pub use project_config::{ProjectConfig, ProjectConfigError};
 pub use redaction::{BasicRedactor, NoopRedactor, Redactor};
-pub use storage::{NewEvent, Storage, StorageError, StorageHandle};
+pub use storage::{NewEvent, Storage, StorageError, StorageHandle, WorkspaceLease};
 pub use trust::{TrustRecord, canonical_workspace, config_hash, trust_key};
 
 /// Name of the SQLite database inside the Data directory.

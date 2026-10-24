@@ -14,9 +14,13 @@ use thais_protocol::error::ProtocolError;
 use thais_protocol::jsonrpc::{Notification, Request, Response};
 use thais_protocol::method;
 use thais_protocol::session::{
-    InitializeParams, InitializeResult, SessionApproveParams, SessionApproveResult,
-    SessionCancelParams, SessionCancelResult, SessionCreateParams, SessionCreateResult,
-    SessionSendParams, SessionSendResult, SessionSubscribeParams, SessionSubscribeResult,
+    InitializeParams, InitializeResult, ModelsListResult, SessionApproveParams,
+    SessionApproveResult, SessionArchiveParams, SessionArchiveResult, SessionCancelParams,
+    SessionCancelResult, SessionCreateParams, SessionCreateResult, SessionDeleteParams,
+    SessionDeleteResult, SessionGetParams, SessionGetResult, SessionListParams, SessionListResult,
+    SessionRenameParams, SessionRenameResult, SessionResumeParams, SessionResumeResult,
+    SessionSendParams, SessionSendResult, SessionSetModelParams, SessionSetModelResult,
+    SessionSubscribeParams, SessionSubscribeResult,
 };
 use thiserror::Error;
 
@@ -110,6 +114,91 @@ impl<T: Transport> Client<T> {
     ) -> Result<SessionCreateResult, SdkError> {
         let value = self
             .request(method::SESSION_CREATE, serde_json::to_value(params)?)
+            .await?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    /// List sessions.
+    pub async fn session_list(
+        &self,
+        params: SessionListParams,
+    ) -> Result<SessionListResult, SdkError> {
+        let value = self
+            .request(method::SESSION_LIST, serde_json::to_value(params)?)
+            .await?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    /// Get one session.
+    pub async fn session_get(
+        &self,
+        params: SessionGetParams,
+    ) -> Result<SessionGetResult, SdkError> {
+        let value = self
+            .request(method::SESSION_GET, serde_json::to_value(params)?)
+            .await?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    /// Rename a session.
+    pub async fn session_rename(
+        &self,
+        params: SessionRenameParams,
+    ) -> Result<SessionRenameResult, SdkError> {
+        let value = self
+            .request(method::SESSION_RENAME, serde_json::to_value(params)?)
+            .await?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    /// Archive a session.
+    pub async fn session_archive(
+        &self,
+        params: SessionArchiveParams,
+    ) -> Result<SessionArchiveResult, SdkError> {
+        let value = self
+            .request(method::SESSION_ARCHIVE, serde_json::to_value(params)?)
+            .await?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    /// Soft-delete a session.
+    pub async fn session_delete(
+        &self,
+        params: SessionDeleteParams,
+    ) -> Result<SessionDeleteResult, SdkError> {
+        let value = self
+            .request(method::SESSION_DELETE, serde_json::to_value(params)?)
+            .await?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    /// Resume a session.
+    pub async fn session_resume(
+        &self,
+        params: SessionResumeParams,
+    ) -> Result<SessionResumeResult, SdkError> {
+        let value = self
+            .request(method::SESSION_RESUME, serde_json::to_value(params)?)
+            .await?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    /// Change a role model.
+    pub async fn session_set_model(
+        &self,
+        params: SessionSetModelParams,
+    ) -> Result<SessionSetModelResult, SdkError> {
+        let value = self
+            .request(method::SESSION_SET_MODEL, serde_json::to_value(params)?)
+            .await?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    /// List models.
+    pub async fn models_list(&self) -> Result<ModelsListResult, SdkError> {
+        let value = self
+            .request(method::MODELS_LIST, serde_json::json!({}))
             .await?;
         Ok(serde_json::from_value(value)?)
     }
@@ -235,8 +324,10 @@ mod tests {
         let error = client
             .session_create(SessionCreateParams {
                 workspace: "/tmp".to_owned(),
+                name: None,
                 mode: SessionMode::Build,
                 model: None,
+                steal_lease: false,
             })
             .await
             .expect_err("error");

@@ -15,10 +15,14 @@ use thais_protocol::event::{EventEnvelope, EventKind};
 use thais_protocol::jsonrpc::{Id, Request, Response};
 use thais_protocol::method;
 use thais_protocol::session::{
-    ApprovalDecision, InitializeParams, InitializeResult, SessionApproveParams,
-    SessionApproveResult, SessionCancelParams, SessionCancelResult, SessionCreateParams,
-    SessionCreateResult, SessionInfo, SessionMode, SessionSendParams, SessionSendResult,
-    SessionStatus, SessionSubscribeParams, SessionSubscribeResult,
+    ApprovalDecision, InitializeParams, InitializeResult, ModelInfo, ModelsListResult,
+    SessionApproveParams, SessionApproveResult, SessionArchiveParams, SessionArchiveResult,
+    SessionCancelParams, SessionCancelResult, SessionCreateParams, SessionCreateResult,
+    SessionDeleteParams, SessionDeleteResult, SessionGetParams, SessionGetResult, SessionInfo,
+    SessionListParams, SessionListResult, SessionMode, SessionRenameParams, SessionRenameResult,
+    SessionResumeParams, SessionResumeResult, SessionSendParams, SessionSendResult,
+    SessionSetModelParams, SessionSetModelResult, SessionStatus, SessionSubscribeParams,
+    SessionSubscribeResult,
 };
 use thais_providers::{
     ChatEvent, ChatMessage, ChatRequest, Provider, ToolCall, ToolDefinition, Usage,
@@ -31,9 +35,12 @@ use thiserror::Error;
 use tokio::sync::{Mutex, broadcast, oneshot};
 use tokio_util::sync::CancellationToken;
 
+use crate::checkpoint::{CheckpointState, read_checkpoint, write_checkpoint};
 use crate::clock::Clock;
 use crate::context::{ContextError, ContextManager, estimate_tokens};
 use crate::ids::IdGenerator;
+use crate::model_policy::ModelPolicy;
+use crate::provider_registry::{CatalogModel, ProviderRegistry};
 use crate::replay::{ReplayError, ReplayState};
 use crate::snapshot::{SnapshotError, SnapshotManager};
 use crate::verifier::{Verification, Verifier};
@@ -42,6 +49,19 @@ const MAX_TOOL_ITERATIONS: usize = 8;
 const MAX_TURN_TOKENS: u64 = 50_000;
 const MAX_TURN_TIME: Duration = Duration::from_secs(180);
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(60);
+const LEASE_TTL_SECS: u64 = 300;
+const DEFAULT_MAX_TURN_COST_USD: f64 = 2.0;
+
+fn model_info(model: CatalogModel) -> ModelInfo {
+    ModelInfo {
+        id: model.id,
+        provider: model.provider,
+        context_window: model.context_window,
+        supports_tools: model.supports_tools,
+        input_cost_per_million: model.input_cost_per_million,
+        output_cost_per_million: model.output_cost_per_million,
+    }
+}
 
 /// Runtime failures.
 #[derive(Debug, Error)]
@@ -79,6 +99,12 @@ pub enum RuntimeError {
     /// Snapshot failure.
     #[error("snapshot error: {0}")]
     Snapshot(#[from] SnapshotError),
+    /// The workspace is leased by another mutating session.
+    #[error("workspace is leased by session {0}")]
+    LeaseHeld(String),
+    /// Checkpoint failure.
+    #[error("checkpoint error: {0}")]
+    Checkpoint(#[from] crate::checkpoint::CheckpointError),
 }
 
 impl RuntimeError {
@@ -88,13 +114,15 @@ impl RuntimeError {
             | Self::TurnInProgress(_)
             | Self::ApprovalNotFound(_)
             | Self::InvalidRequest(_)
-            | Self::InvalidWorkspace => INVALID_PARAMS,
+            | Self::InvalidWorkspace
+            | Self::LeaseHeld(_) => INVALID_PARAMS,
             Self::Storage(_)
             | Self::Provider(_)
             | Self::Context(_)
             | Self::Tool(_)
             | Self::Replay(_)
-            | Self::Snapshot(_) => INTERNAL_ERROR,
+            | Self::Snapshot(_)
+            | Self::Checkpoint(_) => INTERNAL_ERROR,
         };
         ErrorObject::new(code, self.to_string())
     }
@@ -150,11 +178,13 @@ struct TurnState {
 /// The headless runtime shared by the stdio server, the CLI, and tests.
 pub struct Runtime {
     storage: StorageHandle,
-    provider: Arc<dyn Provider>,
+    providers: Arc<ProviderRegistry>,
     clock: Arc<dyn Clock>,
     ids: Arc<dyn IdGenerator>,
     context: ContextManager,
     snapshot_base: Option<PathBuf>,
+    checkpoint_base: Option<PathBuf>,
+    max_turn_cost_usd: f64,
     verifier: Option<Arc<Verifier>>,
     sessions: Mutex<HashMap<String, SessionState>>,
     approvals: Mutex<HashMap<String, oneshot::Sender<ApprovalDecision>>>,
@@ -174,11 +204,39 @@ impl Runtime {
         let (events, _) = broadcast::channel(1024);
         Self {
             storage,
-            provider,
+            providers: Arc::new(ProviderRegistry::single(provider)),
             clock,
             ids,
             context,
             snapshot_base: None,
+            checkpoint_base: None,
+            max_turn_cost_usd: DEFAULT_MAX_TURN_COST_USD,
+            verifier: None,
+            sessions: Mutex::new(HashMap::new()),
+            approvals: Mutex::new(HashMap::new()),
+            events,
+        }
+    }
+
+    /// Build a runtime backed by a provider registry.
+    #[must_use]
+    pub fn with_registry(
+        storage: StorageHandle,
+        providers: Arc<ProviderRegistry>,
+        clock: Arc<dyn Clock>,
+        ids: Arc<dyn IdGenerator>,
+        context: ContextManager,
+    ) -> Self {
+        let (events, _) = broadcast::channel(1024);
+        Self {
+            storage,
+            providers,
+            clock,
+            ids,
+            context,
+            snapshot_base: None,
+            checkpoint_base: None,
+            max_turn_cost_usd: DEFAULT_MAX_TURN_COST_USD,
             verifier: None,
             sessions: Mutex::new(HashMap::new()),
             approvals: Mutex::new(HashMap::new()),
@@ -200,6 +258,20 @@ impl Runtime {
         self
     }
 
+    /// Store checkpoints under the supplied base directory.
+    #[must_use]
+    pub fn with_checkpoint_base(mut self, base: impl Into<PathBuf>) -> Self {
+        self.checkpoint_base = Some(base.into());
+        self
+    }
+
+    /// Set the per-turn cost budget in USD.
+    #[must_use]
+    pub fn with_cost_limit(mut self, limit: f64) -> Self {
+        self.max_turn_cost_usd = limit.max(0.0);
+        self
+    }
+
     /// Subscribe to every live event emitted by this runtime.
     #[must_use]
     pub fn subscribe_live(&self) -> broadcast::Receiver<EventEnvelope> {
@@ -213,6 +285,19 @@ impl Runtime {
         mode: SessionMode,
         model: Option<String>,
     ) -> Result<SessionInfo, RuntimeError> {
+        self.create_session_with(workspace, mode, model, None, false)
+            .await
+    }
+
+    /// Create a named session, optionally stealing a workspace lease.
+    pub async fn create_session_with(
+        &self,
+        workspace: impl Into<String>,
+        mode: SessionMode,
+        model: Option<String>,
+        name: Option<String>,
+        steal_lease: bool,
+    ) -> Result<SessionInfo, RuntimeError> {
         let workspace = workspace.into();
         let canonical = thais_storage::canonical_workspace(Path::new(&workspace))
             .map_err(|error| RuntimeError::InvalidRequest(format!("invalid workspace: {error}")))?;
@@ -223,26 +308,89 @@ impl Runtime {
         let model = match model {
             Some(model) => model,
             None => self
-                .provider
+                .providers
                 .models()
                 .await?
                 .first()
                 .map(|model| model.id.clone())
+                .or_else(|| self.providers.default_model().map(ToOwned::to_owned))
                 .unwrap_or_else(|| "fake-model".to_owned()),
         };
         let session_id = self.ids.new_id("session");
         let timestamp = self.clock.now_rfc3339();
+        let name = name.unwrap_or_else(|| {
+            Path::new(&canonical)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("session")
+                .to_owned()
+        });
+
+        if mode == SessionMode::Build
+            && let Some(holder) = self
+                .storage
+                .acquire_lease(
+                    canonical.clone(),
+                    session_id.clone(),
+                    LEASE_TTL_SECS,
+                    steal_lease,
+                )
+                .await?
+        {
+            return Err(RuntimeError::LeaseHeld(holder.session_id));
+        }
+
         let info = SessionInfo {
             session_id: session_id.clone(),
+            name,
             workspace: canonical,
             mode,
-            model,
+            model: model.clone(),
+            model_policy: json!({"default": model}),
+            input_tokens: 0,
+            output_tokens: 0,
+            cost_usd: 0.0,
             status: SessionStatus::Active,
             created_at: timestamp.clone(),
             updated_at: timestamp,
         };
 
-        self.storage.create_session(info.clone()).await?;
+        if let Err(error) = self.storage.create_session(info.clone()).await {
+            if info.mode == SessionMode::Build {
+                let _ = self
+                    .storage
+                    .release_lease(info.workspace.clone(), session_id.clone())
+                    .await;
+            }
+            return Err(error.into());
+        }
+        let tools = self.session_state(&info)?;
+        self.sessions.lock().await.insert(session_id.clone(), tools);
+        let checkpoint_path = self.checkpoint_path(&session_id);
+        write_checkpoint(
+            &checkpoint_path,
+            &CheckpointState {
+                session_id: session_id.clone(),
+                name: info.name.clone(),
+                workspace: info.workspace.clone(),
+                mode: info.mode,
+                model_policy: info.model_policy.clone(),
+                state: "active".to_owned(),
+                plan: None,
+                tasks: Vec::new(),
+                updated_at: self.clock.now_rfc3339(),
+            },
+        )?;
+        self.append_event(
+            &session_id,
+            EventKind::SessionCreated,
+            json!({"session": &info}),
+        )
+        .await?;
+        Ok(info)
+    }
+
+    fn session_state(&self, info: &SessionInfo) -> Result<SessionState, RuntimeError> {
         let tools = match info.mode {
             SessionMode::Plan => ToolRegistry::read_only(Path::new(&info.workspace))?,
             SessionMode::Build => ToolRegistry::read_write(Path::new(&info.workspace))?,
@@ -255,24 +403,24 @@ impl Runtime {
             .snapshot_base
             .clone()
             .unwrap_or_else(|| std::env::temp_dir().join("thais-snapshots"));
-        let snapshots =
-            SnapshotManager::new(Path::new(&info.workspace), &snapshot_root.join(&session_id))?;
-        self.sessions.lock().await.insert(
-            session_id.clone(),
-            SessionState {
-                turn: None,
-                tools: Arc::new(tools),
-                gate,
-                snapshots: Arc::new(snapshots),
-            },
-        );
-        self.append_event(
-            &session_id,
-            EventKind::SessionCreated,
-            json!({"session": &info}),
-        )
-        .await?;
-        Ok(info)
+        let snapshots = SnapshotManager::new(
+            Path::new(&info.workspace),
+            &snapshot_root.join(&info.session_id),
+        )?;
+        Ok(SessionState {
+            turn: None,
+            tools: Arc::new(tools),
+            gate,
+            snapshots: Arc::new(snapshots),
+        })
+    }
+
+    fn checkpoint_path(&self, session_id: &str) -> PathBuf {
+        let base = self
+            .checkpoint_base
+            .clone()
+            .unwrap_or_else(|| std::env::temp_dir().join("thais-sessions"));
+        base.join(session_id).join("checkpoint.md")
     }
 
     /// Fetch session metadata.
@@ -283,6 +431,243 @@ impl Runtime {
     /// List session metadata.
     pub async fn list_sessions(&self) -> Result<Vec<SessionInfo>, RuntimeError> {
         Ok(self.storage.list_sessions().await?)
+    }
+
+    /// List sessions, optionally including archived ones.
+    pub async fn list_sessions_with_archived(
+        &self,
+        include_archived: bool,
+    ) -> Result<Vec<SessionInfo>, RuntimeError> {
+        Ok(self
+            .storage
+            .list_sessions_with_archived(include_archived)
+            .await?)
+    }
+
+    /// Rename a session and persist its checkpoint.
+    pub async fn rename_session(
+        &self,
+        session_id: &str,
+        name: &str,
+    ) -> Result<SessionInfo, RuntimeError> {
+        let session = self
+            .storage
+            .rename_session(session_id.to_owned(), name.to_owned())
+            .await?;
+        self.persist_checkpoint(session_id, "active", None, Vec::new())
+            .await?;
+        Ok(session)
+    }
+
+    /// Archive a session and release its lease.
+    pub async fn archive_session(&self, session_id: &str) -> Result<SessionInfo, RuntimeError> {
+        let session = self.storage.archive_session(session_id.to_owned()).await?;
+        if session.mode == SessionMode::Build {
+            let _ = self
+                .storage
+                .release_lease(session.workspace.clone(), session_id.to_owned())
+                .await;
+        }
+        self.persist_checkpoint(session_id, "archived", None, Vec::new())
+            .await?;
+        self.sessions.lock().await.remove(session_id);
+        Ok(session)
+    }
+
+    /// Soft-delete a session and release its lease.
+    pub async fn delete_session(&self, session_id: &str) -> Result<bool, RuntimeError> {
+        let session = self.storage.get_session(session_id.to_owned()).await?;
+        let deleted = self.storage.delete_session(session_id.to_owned()).await?;
+        if session.mode == SessionMode::Build {
+            let _ = self
+                .storage
+                .release_lease(session.workspace.clone(), session_id.to_owned())
+                .await;
+        }
+        self.sessions.lock().await.remove(session_id);
+        Ok(deleted)
+    }
+
+    /// Resume a persisted session, rehydrating runtime state and pending approvals.
+    pub async fn resume_session(
+        &self,
+        session_id: &str,
+    ) -> Result<SessionResumeResult, RuntimeError> {
+        let session = self.storage.get_session(session_id.to_owned()).await?;
+        if session.status == SessionStatus::Deleted {
+            return Err(RuntimeError::SessionNotFound(session_id.to_owned()));
+        }
+        if session.mode == SessionMode::Build
+            && let Some(holder) = self
+                .storage
+                .acquire_lease(
+                    session.workspace.clone(),
+                    session_id.to_owned(),
+                    LEASE_TTL_SECS,
+                    false,
+                )
+                .await?
+        {
+            return Err(RuntimeError::LeaseHeld(holder.session_id));
+        }
+        if !self.sessions.lock().await.contains_key(session_id) {
+            let state = self.session_state(&session)?;
+            self.sessions
+                .lock()
+                .await
+                .insert(session_id.to_owned(), state);
+        }
+        let checkpoint =
+            read_checkpoint(&self.checkpoint_path(session_id))?.map(|state| state.summary());
+        let pending_approvals = self
+            .storage
+            .pending_approvals(session_id.to_owned())
+            .await?;
+        Ok(SessionResumeResult {
+            session,
+            checkpoint,
+            pending_approvals,
+        })
+    }
+
+    /// Change a role's model in the session policy.
+    pub async fn set_model(
+        &self,
+        session_id: &str,
+        role: &str,
+        model: &str,
+    ) -> Result<SessionInfo, RuntimeError> {
+        if !matches!(
+            role,
+            "default" | "plan" | "build" | "explore" | "general" | "compact"
+        ) {
+            return Err(RuntimeError::InvalidRequest(format!(
+                "unknown model role: {role}"
+            )));
+        }
+        let session = self.storage.get_session(session_id.to_owned()).await?;
+        let mut policy = session.model_policy.clone();
+        if !policy.is_object() {
+            policy = json!({});
+        }
+        if role == "default" {
+            policy["default"] = json!(model);
+        } else {
+            if !policy
+                .get("roles")
+                .is_some_and(serde_json::Value::is_object)
+            {
+                policy["roles"] = json!({});
+            }
+            policy["roles"][role] = json!([model]);
+        }
+        let session = self
+            .storage
+            .update_session_model_policy(session_id.to_owned(), policy)
+            .await?;
+        let session = if role == "default" {
+            self.storage
+                .update_session_model(session_id.to_owned(), model.to_owned())
+                .await?
+        } else {
+            session
+        };
+        self.append_event(
+            session_id,
+            EventKind::ModelChanged,
+            json!({"role": role, "model": model}),
+        )
+        .await?;
+        self.persist_checkpoint(session_id, "active", None, Vec::new())
+            .await?;
+        Ok(session)
+    }
+
+    /// List models exposed by the active provider.
+    pub async fn list_models(&self) -> Result<Vec<ModelInfo>, RuntimeError> {
+        let models = self.providers.models().await?;
+        Ok(models.into_iter().map(model_info).collect())
+    }
+
+    async fn model_candidates(
+        &self,
+        session: &SessionInfo,
+        role: &str,
+        model_override: Option<&str>,
+    ) -> Result<Vec<String>, RuntimeError> {
+        let policy = ModelPolicy::from_value(&session.model_policy);
+        let requested =
+            model_override.map_or_else(|| policy.candidates(role), |model| vec![model.to_owned()]);
+        let catalog = self.providers.models().await?;
+        let requested_first = requested.first().cloned();
+        let mut candidates: Vec<String> = requested
+            .into_iter()
+            .filter(|model| {
+                self.providers.provider_for(model).is_some()
+                    && catalog
+                        .iter()
+                        .find(|candidate| &candidate.id == model)
+                        .is_none_or(|candidate| candidate.supports_tools)
+            })
+            .collect();
+        candidates.dedup();
+        if candidates.is_empty() && model_override.is_none() {
+            candidates = catalog
+                .iter()
+                .filter(|model| model.supports_tools)
+                .map(|model| model.id.clone())
+                .collect();
+            candidates.dedup();
+        }
+        if candidates.is_empty() {
+            return Err(RuntimeError::InvalidRequest(if model_override.is_some() {
+                "the override model is unavailable or does not support tool calling".to_owned()
+            } else {
+                "no model with tool calling is available".to_owned()
+            }));
+        }
+        if let Some(first) = requested_first
+            && candidates.first() != Some(&first)
+        {
+            self.append_event(
+                &session.session_id,
+                EventKind::ModelChanged,
+                json!({"role": role, "model": candidates[0], "reason": "fallback"}),
+            )
+            .await?;
+        }
+        Ok(candidates)
+    }
+
+    async fn persist_checkpoint(
+        &self,
+        session_id: &str,
+        state: &str,
+        plan: Option<String>,
+        tasks: Vec<String>,
+    ) -> Result<(), RuntimeError> {
+        let session = self.storage.get_session(session_id.to_owned()).await?;
+        let path = self.checkpoint_path(session_id);
+        let previous = read_checkpoint(&path)?;
+        let plan = plan.or_else(|| previous.as_ref().and_then(|state| state.plan.clone()));
+        let tasks = if tasks.is_empty() {
+            previous.map_or_else(Vec::new, |state| state.tasks)
+        } else {
+            tasks
+        };
+        let checkpoint = CheckpointState {
+            session_id: session.session_id,
+            name: session.name,
+            workspace: session.workspace,
+            mode: session.mode,
+            model_policy: session.model_policy,
+            state: state.to_owned(),
+            plan,
+            tasks,
+            updated_at: self.clock.now_rfc3339(),
+        };
+        write_checkpoint(&path, &checkpoint)?;
+        Ok(())
     }
 
     /// Rebuild a session view from the Event Log.
@@ -297,6 +682,48 @@ impl Runtime {
         input: String,
         turn_id: Option<String>,
     ) -> Result<String, RuntimeError> {
+        self.send_with_model(session_id, input, turn_id, None).await
+    }
+
+    /// Start a turn with an optional per-turn model override.
+    pub async fn send_with_model(
+        self: &Arc<Self>,
+        session_id: &str,
+        input: String,
+        turn_id: Option<String>,
+        model: Option<String>,
+    ) -> Result<String, RuntimeError> {
+        let session_info = self.storage.get_session(session_id.to_owned()).await?;
+        if session_info.status != SessionStatus::Active {
+            return Err(RuntimeError::InvalidRequest(format!(
+                "session {} is {}",
+                session_id,
+                session_info.status.as_str()
+            )));
+        }
+        if session_info.mode == SessionMode::Build {
+            let renewed = self
+                .storage
+                .renew_lease(
+                    session_info.workspace.clone(),
+                    session_id.to_owned(),
+                    LEASE_TTL_SECS,
+                )
+                .await?;
+            if !renewed
+                && let Some(holder) = self
+                    .storage
+                    .acquire_lease(
+                        session_info.workspace.clone(),
+                        session_id.to_owned(),
+                        LEASE_TTL_SECS,
+                        false,
+                    )
+                    .await?
+            {
+                return Err(RuntimeError::LeaseHeld(holder.session_id));
+            }
+        }
         let turn_id = turn_id.unwrap_or_else(|| self.ids.new_id("turn"));
         let cancel = CancellationToken::new();
 
@@ -331,7 +758,7 @@ impl Runtime {
         let turn = turn_id.clone();
         tokio::spawn(async move {
             runtime
-                .run_turn(session, turn, input, cancel, tools, gate, snapshots)
+                .run_turn(session, turn, input, model, cancel, tools, gate, snapshots)
                 .await;
         });
         Ok(turn_id)
@@ -365,17 +792,34 @@ impl Runtime {
     ) -> Result<bool, RuntimeError> {
         self.storage.get_session(session_id.to_owned()).await?;
         let sender = self.approvals.lock().await.remove(approval_id);
-        let Some(sender) = sender else {
-            return Ok(false);
+        let decision_text = match decision {
+            ApprovalDecision::Allow => "allow",
+            ApprovalDecision::Deny => "deny",
         };
-        let _ = sender.send(decision);
-        self.append_event(
-            session_id,
-            EventKind::PermissionResolved,
-            json!({"approval_id": approval_id, "decision": decision}),
-        )
-        .await?;
-        Ok(true)
+        let resolved = self
+            .storage
+            .resolve_approval(approval_id.to_owned(), decision_text.to_owned(), None)
+            .await?;
+        if let Some(sender) = sender {
+            let _ = sender.send(decision);
+            self.append_event(
+                session_id,
+                EventKind::PermissionResolved,
+                json!({"approval_id": approval_id, "decision": decision}),
+            )
+            .await?;
+            return Ok(true);
+        }
+        if resolved {
+            self.append_event(
+                session_id,
+                EventKind::PermissionResolved,
+                json!({"approval_id": approval_id, "decision": decision}),
+            )
+            .await?;
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     /// Request approval for an action and wait for a decision.
@@ -391,6 +835,9 @@ impl Runtime {
             .lock()
             .await
             .insert(approval_id.clone(), sender);
+        self.storage
+            .insert_pending_approval(approval_id.clone(), session_id.to_owned(), action.clone())
+            .await?;
         self.append_event(
             session_id,
             EventKind::PermissionRequested,
@@ -400,9 +847,27 @@ impl Runtime {
 
         match tokio::time::timeout(APPROVAL_TIMEOUT, receiver).await {
             Ok(Ok(decision)) => Ok(decision),
-            Ok(Err(_)) => Err(RuntimeError::ApprovalNotFound(approval_id)),
+            Ok(Err(_)) => {
+                let _ = self
+                    .storage
+                    .resolve_approval(
+                        approval_id.clone(),
+                        "deny".to_owned(),
+                        Some("approval channel closed".to_owned()),
+                    )
+                    .await;
+                Err(RuntimeError::ApprovalNotFound(approval_id))
+            }
             Err(_) => {
                 self.approvals.lock().await.remove(&approval_id);
+                let _ = self
+                    .storage
+                    .resolve_approval(
+                        approval_id.clone(),
+                        "deny".to_owned(),
+                        Some("approval timeout".to_owned()),
+                    )
+                    .await;
                 self.append_event(
                     session_id,
                     EventKind::PermissionResolved,
@@ -477,6 +942,12 @@ impl Runtime {
                 Err(broadcast::error::RecvError::Closed) => break,
             }
         }
+        if session.mode == SessionMode::Build {
+            let _ = self
+                .storage
+                .release_lease(session.workspace.clone(), session.session_id.clone())
+                .await;
+        }
         Ok((session, turn_id, events))
     }
 
@@ -529,7 +1000,13 @@ impl Runtime {
                     }
                 };
                 match self
-                    .create_session(params.workspace, params.mode, params.model)
+                    .create_session_with(
+                        params.workspace,
+                        params.mode,
+                        params.model,
+                        params.name,
+                        params.steal_lease,
+                    )
                     .await
                 {
                     Ok(session) => RequestOutcome::ok(id, &SessionCreateResult { session }),
@@ -547,7 +1024,12 @@ impl Runtime {
                     }
                 };
                 match self
-                    .send(&params.session_id, params.input, params.turn_id)
+                    .send_with_model(
+                        &params.session_id,
+                        params.input,
+                        params.turn_id,
+                        params.model,
+                    )
                     .await
                 {
                     Ok(turn_id) => RequestOutcome::ok(id, &SessionSendResult { turn_id }),
@@ -612,6 +1094,125 @@ impl Runtime {
                     Err(error) => RequestOutcome::error(id, error.to_error_object()),
                 }
             }
+            method::SESSION_LIST => {
+                let params: SessionListParams = if request.params.is_null() {
+                    SessionListParams::default()
+                } else {
+                    match request.params_as() {
+                        Ok(params) => params,
+                        Err(error) => {
+                            return RequestOutcome::error(
+                                id,
+                                ProtocolError::InvalidParams(error.to_string()).to_error_object(),
+                            );
+                        }
+                    }
+                };
+                match self
+                    .list_sessions_with_archived(params.include_archived)
+                    .await
+                {
+                    Ok(sessions) => RequestOutcome::ok(id, &SessionListResult { sessions }),
+                    Err(error) => RequestOutcome::error(id, error.to_error_object()),
+                }
+            }
+            method::SESSION_GET => {
+                let params: SessionGetParams = match request.params_as() {
+                    Ok(params) => params,
+                    Err(error) => {
+                        return RequestOutcome::error(
+                            id,
+                            ProtocolError::InvalidParams(error.to_string()).to_error_object(),
+                        );
+                    }
+                };
+                match self.get_session(&params.session_id).await {
+                    Ok(session) => RequestOutcome::ok(id, &SessionGetResult { session }),
+                    Err(error) => RequestOutcome::error(id, error.to_error_object()),
+                }
+            }
+            method::SESSION_RENAME => {
+                let params: SessionRenameParams = match request.params_as() {
+                    Ok(params) => params,
+                    Err(error) => {
+                        return RequestOutcome::error(
+                            id,
+                            ProtocolError::InvalidParams(error.to_string()).to_error_object(),
+                        );
+                    }
+                };
+                match self.rename_session(&params.session_id, &params.name).await {
+                    Ok(session) => RequestOutcome::ok(id, &SessionRenameResult { session }),
+                    Err(error) => RequestOutcome::error(id, error.to_error_object()),
+                }
+            }
+            method::SESSION_ARCHIVE => {
+                let params: SessionArchiveParams = match request.params_as() {
+                    Ok(params) => params,
+                    Err(error) => {
+                        return RequestOutcome::error(
+                            id,
+                            ProtocolError::InvalidParams(error.to_string()).to_error_object(),
+                        );
+                    }
+                };
+                match self.archive_session(&params.session_id).await {
+                    Ok(session) => RequestOutcome::ok(id, &SessionArchiveResult { session }),
+                    Err(error) => RequestOutcome::error(id, error.to_error_object()),
+                }
+            }
+            method::SESSION_DELETE => {
+                let params: SessionDeleteParams = match request.params_as() {
+                    Ok(params) => params,
+                    Err(error) => {
+                        return RequestOutcome::error(
+                            id,
+                            ProtocolError::InvalidParams(error.to_string()).to_error_object(),
+                        );
+                    }
+                };
+                match self.delete_session(&params.session_id).await {
+                    Ok(deleted) => RequestOutcome::ok(id, &SessionDeleteResult { deleted }),
+                    Err(error) => RequestOutcome::error(id, error.to_error_object()),
+                }
+            }
+            method::SESSION_RESUME => {
+                let params: SessionResumeParams = match request.params_as() {
+                    Ok(params) => params,
+                    Err(error) => {
+                        return RequestOutcome::error(
+                            id,
+                            ProtocolError::InvalidParams(error.to_string()).to_error_object(),
+                        );
+                    }
+                };
+                match self.resume_session(&params.session_id).await {
+                    Ok(result) => RequestOutcome::ok(id, &result),
+                    Err(error) => RequestOutcome::error(id, error.to_error_object()),
+                }
+            }
+            method::SESSION_SET_MODEL => {
+                let params: SessionSetModelParams = match request.params_as() {
+                    Ok(params) => params,
+                    Err(error) => {
+                        return RequestOutcome::error(
+                            id,
+                            ProtocolError::InvalidParams(error.to_string()).to_error_object(),
+                        );
+                    }
+                };
+                match self
+                    .set_model(&params.session_id, &params.role, &params.model)
+                    .await
+                {
+                    Ok(session) => RequestOutcome::ok(id, &SessionSetModelResult { session }),
+                    Err(error) => RequestOutcome::error(id, error.to_error_object()),
+                }
+            }
+            method::MODELS_LIST => match self.list_models().await {
+                Ok(models) => RequestOutcome::ok(id, &ModelsListResult { models }),
+                Err(error) => RequestOutcome::error(id, error.to_error_object()),
+            },
             other => RequestOutcome::error(
                 id,
                 ProtocolError::MethodNotFound(other.to_owned()).to_error_object(),
@@ -643,6 +1244,7 @@ impl Runtime {
         session_id: String,
         turn_id: String,
         input: String,
+        model: Option<String>,
         cancel: CancellationToken,
         tools: Arc<ToolRegistry>,
         gate: PermissionGate,
@@ -653,6 +1255,7 @@ impl Runtime {
                 &session_id,
                 &turn_id,
                 &input,
+                model.as_deref(),
                 &cancel,
                 tools,
                 gate,
@@ -686,16 +1289,55 @@ impl Runtime {
         session_id: &str,
         turn_id: &str,
         input: &str,
+        model_override: Option<&str>,
         cancel: &CancellationToken,
         tools: Arc<ToolRegistry>,
         gate: PermissionGate,
         snapshots: Arc<SnapshotManager>,
     ) -> Result<(), RuntimeError> {
         let session = self.storage.get_session(session_id.to_owned()).await?;
+        let role = if session.mode == SessionMode::Plan {
+            "plan"
+        } else {
+            "build"
+        };
+        let mut candidates = self
+            .model_candidates(&session, role, model_override)
+            .await?;
+        let mut model = candidates.remove(0);
+        let mut pricing = self
+            .providers
+            .models()
+            .await?
+            .into_iter()
+            .find(|candidate| candidate.id == model);
+        let mut provider = self.providers.provider_for(&model).ok_or_else(|| {
+            RuntimeError::Provider(thais_providers::ProviderError::Message(format!(
+                "no provider for model {model}"
+            )))
+        })?;
         let bundle = self
             .context
             .build(Path::new(&session.workspace), input)
             .await?;
+        if let Some(info) = &pricing
+            && bundle.estimated_tokens as u64 > info.context_window
+        {
+            self.append_event(
+                session_id,
+                EventKind::BudgetWarning,
+                json!({
+                    "turn_id": turn_id,
+                    "budget": "context",
+                    "used": bundle.estimated_tokens,
+                    "limit": info.context_window
+                }),
+            )
+            .await?;
+            return Err(RuntimeError::InvalidRequest(
+                "context window exceeded".to_owned(),
+            ));
+        }
         self.append_event(
             session_id,
             EventKind::TurnStarted,
@@ -718,6 +1360,7 @@ impl Runtime {
         ];
         let mut total_tokens = bundle.estimated_tokens as u64;
         let mut total_usage = Usage::default();
+        let mut cost_warned = false;
         let mut repair_attempts = 0_u32;
         let started = tokio::time::Instant::now();
 
@@ -734,12 +1377,46 @@ impl Runtime {
             }
 
             let request = ChatRequest {
-                model: session.model.clone(),
+                model: model.clone(),
                 messages: messages.clone(),
                 tools: tool_definitions.clone(),
                 ..ChatRequest::default()
             };
-            let mut stream = self.provider.chat(request).await?;
+            let mut stream = match provider.chat(request).await {
+                Ok(stream) => stream,
+                Err(error) => {
+                    let fallback = candidates
+                        .iter()
+                        .position(|candidate| self.providers.provider_for(candidate).is_some());
+                    let Some(index) = fallback else {
+                        return Err(RuntimeError::Provider(error));
+                    };
+                    let fallback_model = candidates.remove(index);
+                    let fallback_provider = self
+                        .providers
+                        .provider_for(&fallback_model)
+                        .expect("candidate was checked");
+                    self.append_event(
+                        session_id,
+                        EventKind::ModelChanged,
+                        json!({
+                            "role": role,
+                            "model": fallback_model,
+                            "reason": "provider_error"
+                        }),
+                    )
+                    .await?;
+                    model = fallback_model;
+                    provider = fallback_provider;
+                    pricing = self
+                        .providers
+                        .models()
+                        .await?
+                        .into_iter()
+                        .find(|candidate| candidate.id == model);
+                    continue;
+                }
+            };
             let mut content = String::new();
             let mut accumulators: HashMap<usize, ToolAccumulator> = HashMap::new();
             let mut usage = Usage::default();
@@ -812,6 +1489,42 @@ impl Runtime {
                 .output_tokens
                 .saturating_add(usage.output_tokens);
 
+            let cost_so_far = pricing.as_ref().map_or(0.0, |pricing| {
+                (total_usage.input_tokens as f64 * pricing.input_cost_per_million
+                    + total_usage.output_tokens as f64 * pricing.output_cost_per_million)
+                    / 1_000_000.0
+            });
+            if cost_so_far > self.max_turn_cost_usd {
+                self.append_event(
+                    session_id,
+                    EventKind::BudgetWarning,
+                    json!({
+                        "turn_id": turn_id,
+                        "budget": "cost",
+                        "used": cost_so_far,
+                        "limit": self.max_turn_cost_usd
+                    }),
+                )
+                .await?;
+                return Err(RuntimeError::InvalidRequest(
+                    "cost budget exhausted".to_owned(),
+                ));
+            }
+            if !cost_warned && cost_so_far >= self.max_turn_cost_usd * 0.8 {
+                cost_warned = true;
+                self.append_event(
+                    session_id,
+                    EventKind::BudgetWarning,
+                    json!({
+                        "turn_id": turn_id,
+                        "budget": "cost",
+                        "used": cost_so_far,
+                        "limit": self.max_turn_cost_usd
+                    }),
+                )
+                .await?;
+            }
+
             if accumulators.is_empty() {
                 if session.mode == SessionMode::Plan && !content.trim().is_empty() {
                     let decision = self
@@ -829,15 +1542,43 @@ impl Runtime {
                         }
                     }
                 }
+                let plan = if session.mode == SessionMode::Plan {
+                    Some(content)
+                } else {
+                    None
+                };
+                self.persist_checkpoint(session_id, "ready", plan, Vec::new())
+                    .await?;
+                let cost_usd = pricing.as_ref().map_or(0.0, |pricing| {
+                    (total_usage.input_tokens as f64 * pricing.input_cost_per_million
+                        + total_usage.output_tokens as f64 * pricing.output_cost_per_million)
+                        / 1_000_000.0
+                });
+                let updated = self
+                    .storage
+                    .record_session_usage(
+                        session_id.to_owned(),
+                        total_usage.input_tokens,
+                        total_usage.output_tokens,
+                        cost_usd,
+                    )
+                    .await?;
                 self.append_event(
                     session_id,
                     EventKind::TurnCompleted,
                     json!({
                         "turn_id": turn_id,
+                        "model": model,
                         "usage": {
                             "input_tokens": total_usage.input_tokens,
                             "output_tokens": total_usage.output_tokens
-                        }
+                        },
+                        "session_usage": {
+                            "input_tokens": updated.input_tokens,
+                            "output_tokens": updated.output_tokens,
+                            "cost_usd": updated.cost_usd
+                        },
+                        "cost_usd": cost_usd
                     }),
                 )
                 .await?;

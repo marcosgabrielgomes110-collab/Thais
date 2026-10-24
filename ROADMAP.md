@@ -425,7 +425,7 @@ M3 can run in parallel with M2 after M1. The critical path is M0 → M1 → M2 �
 | M1 Read-only agent | Done | 3–5 weeks |
 | M2 Safe build | Done | 5–7 weeks |
 | Alpha: M0 + M1 + M2 + simple checkpoint | Planned | 12–18 weeks cumulative |
-| M3 Sessions and models | Planned | 4–6 weeks |
+| M3 Sessions and models | Done | 4–6 weeks |
 | M4 Memory and continuity | Planned | 3–5 weeks |
 | M5 Tool ecosystem | Planned | 5–7 weeks |
 | M6 Hardening | Planned | 5–7 weeks |
@@ -436,7 +436,7 @@ Estimates assume one developer with systems experience but new to Rust and this 
 
 ## Current focus
 
-**Alpha — Daily-use feedback release.** M0, M1, and M2 are done and tagged (`v0.2.0-m1`, `v0.3.0-m2`). Alpha adds the simple checkpoint and manual resume. M3 can run in parallel, but the critical path is Alpha feedback before M4.
+**M3 is done and tagged (`v0.4.0-m3`).** M0, M1, and M2 are done and tagged (`v0.2.0-m1`, `v0.3.0-m2`). Alpha adds the simple checkpoint and manual resume; the M3 checkpoint already covers the basic persistence path, so Alpha is now the next product gate. The critical path is Alpha feedback before M4.
 
 Alpha is the first daily-use release: M0 + M1 + M2 + a simple checkpoint. The next gate is a developer using Alpha on a real repository for a week without losing work.
 
@@ -576,6 +576,8 @@ Alpha is the first daily-use release: M0 + M1 + M2 + a simple checkpoint. The ne
 
 ### M3 — Sessions and models
 
+**Status:** Done (`v0.4.0-m3`).
+
 **Goal:** Make sessions and model selection first-class product features, not implicit state.
 
 **Depends on:** M0 and M1; can run in parallel with M2.
@@ -594,6 +596,14 @@ Alpha is the first daily-use release: M0 + M1 + M2 + a simple checkpoint. The ne
 - `session.set_model` for the default or a role; per-turn model override; `model.changed` event.
 - Usage and cost per turn and per session; budget warnings and stops.
 - Model switch rules: tool calling required; smaller context triggers a rebuild or warning; fallback is logged.
+
+**Implementation notes:** M3 ships the session manager, SQLite workspace leases,
+checkpoints, durable pending approvals, provider registry, model catalog and
+roles, native Anthropic plus OpenAI-compatible adapters, per-turn cost budgets,
+TUI session switcher, and CLI `sessions`/`models`. Pending approvals survive a
+restart and are re-surfaced on resume; the original in-flight turn is not
+replayed. Qwen, Z.ai, vLLM, Ollama, and LiteLLM presets are available but not
+launch-validated. The default per-turn cost limit is USD 2.
 
 **Acceptance criteria:**
 
@@ -885,6 +895,7 @@ There are no open v1 decisions. The next decision that needs a choice gets a new
 | 2026-10-23 | Implemented the M0 foundation: workspace, protocol v1, storage, credentials, fake runtime, CLI, tests, protocol docs, rollback spike, and CI |
 | 2026-10-23 | M0 accepted by CI on Linux/macOS, Windows check, and audit; tagged `v0.1.0-m0` |
 | 2026-10-23 | Implemented the M1 read-only loop: Cohere/OpenAI-compatible provider, context manager, environment badge, AGENTS.md, read tools, gate, parallel tool execution, TUI, and budgets |
+| 2026-10-23 | Implemented M3 sessions and models: lifecycle, checkpoints, workspace leases, provider registry, model catalog/roles, Anthropic adapter, cost budgets, TUI switcher, and CLI commands |
 | 2026-10-23 | Implemented the M2 build loop: write/edit/apply_patch, bash, git read tools, shadow-Git snapshots, rollback, verifier, plan approval, diff previews, personality file, and audit events |
 | 2026-10-23 | M1 accepted by CI; M2 implementation started |
 | 2026-10-23 | M2 accepted by CI on Linux/macOS, Windows check, and audit; tagged `v0.3.0-m2`; M1 tagged `v0.2.0-m1` |

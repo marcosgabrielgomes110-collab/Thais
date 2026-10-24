@@ -11,7 +11,8 @@ use thais_protocol::event::EventKind;
 use thais_protocol::jsonrpc::Request;
 use thais_protocol::method;
 use thais_protocol::session::{
-    ApprovalDecision, InitializeResult, SessionCreateResult, SessionMode,
+    ApprovalDecision, InitializeResult, ModelsListResult, SessionCreateResult, SessionListResult,
+    SessionMode, SessionResumeResult,
 };
 use thais_providers::fake::{FakeProvider, FakeScript, FakeStep};
 
@@ -30,6 +31,24 @@ fn runtime_with_scripts(temp: &TempDir, scripts: Vec<FakeScript>) -> Arc<Runtime
     runtime_with_options(temp, scripts, None)
 }
 
+fn runtime_with_prefix(temp: &TempDir, script: FakeScript, prefix: &str) -> Arc<Runtime> {
+    let storage =
+        thais_storage::StorageHandle::open(temp.path().join("thais.db")).expect("storage");
+    let provider: Arc<dyn thais_providers::Provider> =
+        Arc::new(FakeProvider::with_scripts("fake", vec![script]));
+    Arc::new(
+        Runtime::new(
+            storage,
+            provider,
+            Arc::new(FixedClock::new("2026-10-23T00:00:00Z")),
+            Arc::new(SequenceIdGenerator::new(prefix)),
+            ContextManager::empty(),
+        )
+        .with_snapshot_base(temp.path().join("snapshots"))
+        .with_checkpoint_base(temp.path().join("sessions")),
+    )
+}
+
 fn runtime_with_options(
     temp: &TempDir,
     scripts: Vec<FakeScript>,
@@ -46,7 +65,8 @@ fn runtime_with_options(
         Arc::new(SequenceIdGenerator::new("t")),
         ContextManager::empty(),
     )
-    .with_snapshot_base(temp.path().join("snapshots"));
+    .with_snapshot_base(temp.path().join("snapshots"))
+    .with_checkpoint_base(temp.path().join("sessions"));
     if let Some(verifier) = verifier {
         runtime = runtime.with_verifier(verifier);
     }
@@ -99,6 +119,14 @@ async fn run_once_emits_a_deterministic_event_stream() {
     assert_eq!(completed.payload["turn_id"], turn_id);
     assert_eq!(completed.payload["usage"]["input_tokens"], 3);
     assert_eq!(completed.payload["usage"]["output_tokens"], 5);
+    assert_eq!(completed.payload["session_usage"]["input_tokens"], 3);
+    assert_eq!(completed.payload["session_usage"]["output_tokens"], 5);
+    let stored = runtime
+        .get_session(&session.session_id)
+        .await
+        .expect("stored session");
+    assert_eq!(stored.input_tokens, 3);
+    assert_eq!(stored.output_tokens, 5);
     assert!(
         events
             .iter()
@@ -804,4 +832,274 @@ async fn plan_mode_requires_approval_before_switching_to_build() {
             .mode,
         SessionMode::Build
     );
+}
+
+#[tokio::test]
+async fn session_lifecycle_and_checkpoint_survive_restarts() {
+    let temp = tempfile::tempdir().expect("temp");
+    let runtime = runtime(&temp, script(vec![]));
+    let session = runtime
+        .create_session(
+            temp.path().to_string_lossy().into_owned(),
+            SessionMode::Build,
+            None,
+        )
+        .await
+        .expect("create");
+
+    let checkpoint = temp
+        .path()
+        .join("sessions")
+        .join(&session.session_id)
+        .join("checkpoint.md");
+    assert!(checkpoint.exists(), "checkpoint should exist");
+    let text = std::fs::read_to_string(&checkpoint).expect("checkpoint");
+    assert!(text.contains(&session.session_id));
+
+    let renamed = runtime
+        .rename_session(&session.session_id, "renamed")
+        .await
+        .expect("rename");
+    assert_eq!(renamed.name, "renamed");
+
+    let list = runtime.list_sessions().await.expect("list");
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].name, "renamed");
+
+    let archived = runtime
+        .archive_session(&session.session_id)
+        .await
+        .expect("archive");
+    assert_eq!(archived.status.as_str(), "archived");
+    assert!(runtime.list_sessions().await.expect("list").is_empty());
+    assert_eq!(
+        runtime
+            .list_sessions_with_archived(true)
+            .await
+            .expect("list all")
+            .len(),
+        1
+    );
+
+    let resumed = runtime
+        .resume_session(&session.session_id)
+        .await
+        .expect("resume");
+    assert_eq!(resumed.session.name, "renamed");
+    assert!(resumed.checkpoint.is_some());
+
+    assert!(
+        runtime
+            .delete_session(&session.session_id)
+            .await
+            .expect("delete")
+    );
+    assert!(
+        runtime
+            .list_sessions_with_archived(true)
+            .await
+            .expect("list")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn one_mutating_session_per_workspace_and_steal_requires_explicit_flag() {
+    let temp = tempfile::tempdir().expect("temp");
+    let first = runtime(&temp, script(vec![]));
+    let second = runtime_with_prefix(&temp, script(vec![]), "u");
+    let workspace = temp.path().to_string_lossy().into_owned();
+
+    let owner = first
+        .create_session(workspace.clone(), SessionMode::Build, None)
+        .await
+        .expect("owner");
+    let error = second
+        .create_session(workspace.clone(), SessionMode::Build, None)
+        .await
+        .expect_err("lease must block");
+    assert!(
+        matches!(error, RuntimeError::LeaseHeld(_)),
+        "unexpected: {error:?}"
+    );
+
+    let stolen = second
+        .create_session_with(
+            workspace.clone(),
+            SessionMode::Build,
+            None,
+            Some("steal".to_owned()),
+            true,
+        )
+        .await
+        .expect("steal");
+    assert_eq!(stolen.name, "steal");
+
+    let error = first
+        .send(&owner.session_id, "hello".to_owned(), None)
+        .await
+        .expect_err("old owner lost the lease");
+    assert!(matches!(error, RuntimeError::LeaseHeld(_)));
+
+    // Planning sessions never take the mutating lease.
+    second
+        .create_session(workspace.clone(), SessionMode::Plan, None)
+        .await
+        .expect("plan");
+    second
+        .create_session(workspace, SessionMode::Plan, None)
+        .await
+        .expect("second plan");
+}
+
+#[tokio::test]
+async fn pending_approvals_are_durable_across_runtime_instances() {
+    let temp = tempfile::tempdir().expect("temp");
+    let first = runtime(&temp, script(vec![]));
+    let session = first
+        .create_session(
+            temp.path().to_string_lossy().into_owned(),
+            SessionMode::Build,
+            None,
+        )
+        .await
+        .expect("create");
+    let mut live = first.subscribe_live();
+    let waiting = {
+        let runtime = Arc::clone(&first);
+        let session_id = session.session_id.clone();
+        tokio::spawn(async move {
+            runtime
+                .request_approval(&session_id, json!({"type": "write", "path": "a.txt"}))
+                .await
+        })
+    };
+    let approval_id = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let event = live.recv().await.expect("event");
+            if event.kind == EventKind::PermissionRequested {
+                break event.payload["approval_id"]
+                    .as_str()
+                    .expect("approval id")
+                    .to_owned();
+            }
+        }
+    })
+    .await
+    .expect("permission requested");
+
+    let second = runtime(&temp, script(vec![]));
+    let resumed = second
+        .resume_session(&session.session_id)
+        .await
+        .expect("resume");
+    assert!(
+        resumed
+            .pending_approvals
+            .iter()
+            .any(|approval| approval.approval_id == approval_id)
+    );
+    assert!(
+        second
+            .approve(&session.session_id, &approval_id, ApprovalDecision::Deny)
+            .await
+            .expect("approve durable")
+    );
+    let resumed = second
+        .resume_session(&session.session_id)
+        .await
+        .expect("resume again");
+    assert!(resumed.pending_approvals.is_empty());
+    waiting.abort();
+}
+
+#[tokio::test]
+async fn model_policy_and_catalog_are_exposed_through_the_api() {
+    let temp = tempfile::tempdir().expect("temp");
+    let runtime = runtime(&temp, script(vec![]));
+    let session = runtime
+        .create_session(
+            temp.path().to_string_lossy().into_owned(),
+            SessionMode::Build,
+            None,
+        )
+        .await
+        .expect("create");
+
+    let catalog = runtime.list_models().await.expect("models");
+    assert_eq!(catalog.len(), 1);
+    assert_eq!(catalog[0].id, "fake-test");
+
+    let updated = runtime
+        .set_model(&session.session_id, "default", "fake-2")
+        .await
+        .expect("default");
+    assert_eq!(updated.model_policy["default"], "fake-2");
+    assert_eq!(updated.model, "fake-2");
+    let updated = runtime
+        .set_model(&session.session_id, "build", "fake-3")
+        .await
+        .expect("build");
+    assert_eq!(updated.model_policy["roles"]["build"][0], "fake-3");
+
+    let request = Request::new(9_i64, method::MODELS_LIST, json!({}));
+    let outcome = runtime.handle_request(request).await;
+    let result: ModelsListResult = outcome.response.result_as().expect("models result");
+    assert_eq!(result.models[0].id, "fake-test");
+
+    let request = Request::new(
+        10_i64,
+        method::SESSION_LIST,
+        json!({"include_archived": true}),
+    );
+    let outcome = runtime.handle_request(request).await;
+    let result: SessionListResult = outcome.response.result_as().expect("list result");
+    assert_eq!(result.sessions.len(), 1);
+
+    let request = Request::new(
+        11_i64,
+        method::SESSION_RESUME,
+        json!({"session_id": session.session_id}),
+    );
+    let outcome = runtime.handle_request(request).await;
+    let _: SessionResumeResult = outcome.response.result_as().expect("resume result");
+}
+
+#[tokio::test]
+async fn per_turn_model_override_is_accepted_and_logged() {
+    let temp = tempfile::tempdir().expect("temp");
+    let runtime = runtime(
+        &temp,
+        script(vec![FakeStep::Text {
+            text: "override".to_owned(),
+        }]),
+    );
+    let session = runtime
+        .create_session(
+            temp.path().to_string_lossy().into_owned(),
+            SessionMode::Build,
+            None,
+        )
+        .await
+        .expect("create");
+    let mut live = runtime.subscribe_live();
+    runtime
+        .send_with_model(
+            &session.session_id,
+            "hello".to_owned(),
+            None,
+            Some("other-model".to_owned()),
+        )
+        .await
+        .expect("send");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let event = live.recv().await.expect("event");
+            if event.session_id == session.session_id && event.kind == EventKind::TurnCompleted {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("turn completed");
 }

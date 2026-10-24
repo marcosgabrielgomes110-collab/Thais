@@ -286,6 +286,8 @@ The workspace is a Rust workspace with a single `thais` binary and a
 | `make tui PROVIDER=cohere` | Open the TUI with the real Cohere provider (`make tui cohere` also works) |
 | `make tui cohere MODE=plan` | Start the TUI in plan mode; approval switches to build |
 | `make run ARGS="doctor"` | Validate paths, permissions, keyring, and FTS5 |
+| `make run ARGS="sessions --all"` | List persisted sessions, including archived ones |
+| `make run ARGS="models"` | List the provider/model catalog from user config |
 | `make tools` | Install `cargo-nextest`, `cargo-audit`, and `cargo-deny` |
 | `make install PREFIX=...` | Install the binary; `make uninstall` removes only the binary |
 
@@ -312,7 +314,9 @@ thais tui --provider cohere
 ```
 
 The TUI keys are: `Enter` send, `Esc` cancel the active turn (or quit when idle),
-`PageUp`/`PageDown` scroll, `Ctrl+C` quit, and `y`/`n` for approval prompts.
+`PageUp`/`PageDown` scroll, `Ctrl+S` open the session switcher, `Ctrl+C` quit,
+and `y`/`n` for approval prompts. In the switcher, `Up`/`Down` select,
+`Enter` resumes, `a` archives, `x` soft-deletes, and `Esc` closes.
 The headless `thais run` command prints model text to stdout and logs to stderr;
 `--json` emits the NDJSON event stream.
 
@@ -336,6 +340,44 @@ The headless `thais run` command prints model text to stdout and logs to stderr;
 - Personality: edit [PERSONALITY.md](PERSONALITY.md) for this project, or
   `~/.config/thais/PERSONALITY.md` for all projects. Personality shapes tone
   and style but never overrides safety, the gate, or the workspace jail.
+
+### M3 sessions and models
+
+Sessions are first-class and persist in SQLite. Create, list, get, resume,
+rename, archive, and soft-delete through the Agent API or the TUI session
+switcher (`Ctrl+S`). A checkpoint is written to
+`~/.local/share/thais/sessions/<session_id>/checkpoint.md`; archived sessions are
+kept indefinitely and deleted only on explicit request. Pending approvals are
+durable and re-surfaced on resume, but the original in-flight turn is not
+replayed.
+
+Build sessions acquire a SQLite workspace lease: one mutating session per
+workspace across processes, while plan sessions coexist. A lease expires after
+five minutes without renewal. Taking a live lease requires
+`steal_lease: true`; the old owner receives `LeaseHeld` on its next turn.
+
+Providers and models are configured in user config, never in project config:
+
+```sh
+cp docs/providers.example.toml ~/.config/thais/providers.toml
+cp docs/models.example.toml ~/.config/thais/models.toml
+thais auth login openai --account default   # reads the secret from stdin
+thais models
+```
+
+`providers.toml` contains only non-secret fields and references credentials via
+the keyring, environment, or the `0600` fallback. Presets exist for OpenAI,
+Anthropic (native Messages API), OpenRouter, DeepSeek, Cohere, Qwen, Z.ai,
+Ollama, vLLM, and LiteLLM. Qwen, Z.ai, vLLM, Ollama, and LiteLLM are available
+but not launch-validated.
+
+Model roles are `default`, `plan`, `build`, `explore`, `general`, and `compact`;
+each can have an ordered fallback list. `session.set_model` changes a role and
+emits `model_changed`; fallback changes are logged with a reason. The main loop
+rejects models without tool calling. `turn_completed` carries input/output
+tokens, USD cost, and cumulative session totals; the TUI status bar and
+`session.get`/`session.list` expose them. The
+per-turn cost budget defaults to USD 2, warns at 80%, and stops at 100%.
 
 ## Out of scope
 

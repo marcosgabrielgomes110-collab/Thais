@@ -7,7 +7,7 @@ use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, params};
 use thais_protocol::error::ProtocolError;
 use thais_protocol::event::{EventEnvelope, EventKind};
-use thais_protocol::session::{SessionInfo, SessionMode, SessionStatus};
+use thais_protocol::session::{ApprovalInfo, SessionInfo, SessionMode, SessionStatus};
 use thiserror::Error;
 
 use crate::redaction::{BasicRedactor, Redactor};
@@ -46,6 +46,21 @@ impl NewEvent {
             payload,
         }
     }
+}
+
+/// A mutating workspace lease.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceLease {
+    /// Canonical workspace path.
+    pub canonical_workspace: String,
+    /// Session holding the lease.
+    pub session_id: String,
+    /// RFC 3339 acquisition time.
+    pub acquired_at: String,
+    /// RFC 3339 heartbeat time.
+    pub heartbeat_at: String,
+    /// RFC 3339 expiry time.
+    pub expires_at: String,
 }
 
 /// Errors from the storage layer.
@@ -138,19 +153,27 @@ impl Storage {
             );",
         )?;
 
-        let current: i64 = self.conn.query_row(
+        let mut current: i64 = self.conn.query_row(
             "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
             [],
             |row| row.get(0),
         )?;
 
-        if current > 1 {
+        if current > 2 {
             return Err(StorageError::UnsupportedSchema(current));
         }
         if current == 0 {
             self.conn.execute_batch(MIGRATION_1)?;
             self.conn.execute(
                 "INSERT INTO schema_migrations(version, applied_at) VALUES (1, ?1)",
+                params![Utc::now().to_rfc3339()],
+            )?;
+            current = 1;
+        }
+        if current == 1 {
+            self.conn.execute_batch(MIGRATION_2)?;
+            self.conn.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES (2, ?1)",
                 params![Utc::now().to_rfc3339()],
             )?;
         }
@@ -173,15 +196,17 @@ impl Storage {
 
         self.conn.execute(
             "INSERT INTO sessions (
-                session_id, workspace, canonical_workspace, mode, model, status,
-                created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                session_id, name, workspace, canonical_workspace, mode, model,
+                model_policy_json, status, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 session.session_id,
+                session.name,
                 session.workspace,
                 canonical,
                 session.mode.as_str(),
                 session.model,
+                serde_json::to_string(&session.model_policy)?,
                 session.status.as_str(),
                 session.created_at,
                 session.updated_at,
@@ -195,7 +220,8 @@ impl Storage {
         let row = self
             .conn
             .query_row(
-                "SELECT session_id, workspace, mode, model, status, created_at, updated_at
+                "SELECT session_id, name, workspace, mode, model, model_policy_json,
+                        input_tokens, output_tokens, cost_usd, status, created_at, updated_at
                  FROM sessions WHERE session_id = ?1",
                 params![session_id],
                 SessionRow::from_row,
@@ -210,10 +236,27 @@ impl Storage {
 
     /// List sessions in creation order.
     pub fn list_sessions(&self) -> Result<Vec<SessionInfo>, StorageError> {
-        let mut statement = self.conn.prepare(
-            "SELECT session_id, workspace, mode, model, status, created_at, updated_at
-             FROM sessions ORDER BY created_at ASC, session_id ASC",
-        )?;
+        self.list_sessions_with_archived(false)
+    }
+
+    /// List sessions, optionally including archived ones. Soft-deleted sessions
+    /// are never listed.
+    pub fn list_sessions_with_archived(
+        &self,
+        include_archived: bool,
+    ) -> Result<Vec<SessionInfo>, StorageError> {
+        let sql = if include_archived {
+            "SELECT session_id, name, workspace, mode, model, model_policy_json,
+                    input_tokens, output_tokens, cost_usd, status, created_at, updated_at
+             FROM sessions WHERE status != 'deleted'
+             ORDER BY created_at ASC, session_id ASC"
+        } else {
+            "SELECT session_id, name, workspace, mode, model, model_policy_json,
+                    input_tokens, output_tokens, cost_usd, status, created_at, updated_at
+             FROM sessions WHERE status != 'deleted' AND status != 'archived'
+             ORDER BY created_at ASC, session_id ASC"
+        };
+        let mut statement = self.conn.prepare(sql)?;
         let rows = statement.query_map([], SessionRow::from_row)?;
         let rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
         rows.into_iter().map(SessionRow::into_session).collect()
@@ -243,6 +286,262 @@ impl Storage {
             return Err(StorageError::SessionNotFound(session_id.to_owned()));
         }
         Ok(())
+    }
+
+    /// Rename a session.
+    pub fn rename_session(
+        &self,
+        session_id: &str,
+        name: &str,
+    ) -> Result<SessionInfo, StorageError> {
+        let updated = self.conn.execute(
+            "UPDATE sessions SET name = ?1, updated_at = ?2 WHERE session_id = ?3",
+            params![name, Utc::now().to_rfc3339(), session_id],
+        )?;
+        if updated == 0 {
+            return Err(StorageError::SessionNotFound(session_id.to_owned()));
+        }
+        self.get_session(session_id)
+    }
+
+    /// Archive a session.
+    pub fn archive_session(&self, session_id: &str) -> Result<SessionInfo, StorageError> {
+        let now = Utc::now().to_rfc3339();
+        let updated = self.conn.execute(
+            "UPDATE sessions SET status = 'archived', archived_at = ?1, updated_at = ?1
+             WHERE session_id = ?2",
+            params![now, session_id],
+        )?;
+        if updated == 0 {
+            return Err(StorageError::SessionNotFound(session_id.to_owned()));
+        }
+        self.get_session(session_id)
+    }
+
+    /// Soft-delete a session while preserving its Event Log.
+    pub fn delete_session(&self, session_id: &str) -> Result<bool, StorageError> {
+        let now = Utc::now().to_rfc3339();
+        let updated = self.conn.execute(
+            "UPDATE sessions SET status = 'deleted', deleted_at = ?1, updated_at = ?1
+             WHERE session_id = ?2",
+            params![now, session_id],
+        )?;
+        Ok(updated > 0)
+    }
+
+    /// Update the role-based model policy.
+    pub fn update_session_model_policy(
+        &self,
+        session_id: &str,
+        policy: &serde_json::Value,
+    ) -> Result<SessionInfo, StorageError> {
+        let updated = self.conn.execute(
+            "UPDATE sessions SET model_policy_json = ?1, updated_at = ?2 WHERE session_id = ?3",
+            params![
+                serde_json::to_string(policy)?,
+                Utc::now().to_rfc3339(),
+                session_id
+            ],
+        )?;
+        if updated == 0 {
+            return Err(StorageError::SessionNotFound(session_id.to_owned()));
+        }
+        self.get_session(session_id)
+    }
+
+    /// Add a turn's usage and cost to the session totals.
+    pub fn record_session_usage(
+        &self,
+        session_id: &str,
+        input_tokens: u64,
+        output_tokens: u64,
+        cost_usd: f64,
+    ) -> Result<SessionInfo, StorageError> {
+        let updated = self.conn.execute(
+            "UPDATE sessions SET
+                input_tokens = input_tokens + ?1,
+                output_tokens = output_tokens + ?2,
+                cost_usd = cost_usd + ?3,
+                updated_at = ?4
+             WHERE session_id = ?5",
+            params![
+                input_tokens as i64,
+                output_tokens as i64,
+                cost_usd,
+                Utc::now().to_rfc3339(),
+                session_id
+            ],
+        )?;
+        if updated == 0 {
+            return Err(StorageError::SessionNotFound(session_id.to_owned()));
+        }
+        self.get_session(session_id)
+    }
+
+    /// Update the session's default model column.
+    pub fn update_session_model(
+        &self,
+        session_id: &str,
+        model: &str,
+    ) -> Result<SessionInfo, StorageError> {
+        let updated = self.conn.execute(
+            "UPDATE sessions SET model = ?1, updated_at = ?2 WHERE session_id = ?3",
+            params![model, Utc::now().to_rfc3339(), session_id],
+        )?;
+        if updated == 0 {
+            return Err(StorageError::SessionNotFound(session_id.to_owned()));
+        }
+        self.get_session(session_id)
+    }
+
+    /// Acquire or refresh the mutating lease for a workspace.
+    pub fn acquire_lease(
+        &mut self,
+        canonical_workspace: &str,
+        session_id: &str,
+        ttl_secs: u64,
+        steal: bool,
+    ) -> Result<Option<WorkspaceLease>, StorageError> {
+        let now = Utc::now();
+        let now_text = now.to_rfc3339();
+        let expires = (now + chrono::Duration::seconds(ttl_secs as i64)).to_rfc3339();
+        let existing = self.lease_holder(canonical_workspace)?;
+
+        if let Some(lease) = &existing {
+            let expired = lease.expires_at.as_str() <= now_text.as_str();
+            if lease.session_id != session_id && !expired && !steal {
+                return Ok(Some(lease.clone()));
+            }
+        }
+
+        self.conn.execute(
+            "INSERT INTO workspace_leases (
+                canonical_workspace, session_id, acquired_at, heartbeat_at, expires_at
+             ) VALUES (?1, ?2, ?3, ?3, ?4)
+             ON CONFLICT(canonical_workspace) DO UPDATE SET
+                session_id = excluded.session_id,
+                acquired_at = excluded.acquired_at,
+                heartbeat_at = excluded.heartbeat_at,
+                expires_at = excluded.expires_at",
+            params![canonical_workspace, session_id, now_text, expires],
+        )?;
+        Ok(None)
+    }
+
+    /// Refresh a lease held by a session.
+    pub fn renew_lease(
+        &self,
+        canonical_workspace: &str,
+        session_id: &str,
+        ttl_secs: u64,
+    ) -> Result<bool, StorageError> {
+        let now = Utc::now();
+        let expires = (now + chrono::Duration::seconds(ttl_secs as i64)).to_rfc3339();
+        let updated = self.conn.execute(
+            "UPDATE workspace_leases SET heartbeat_at = ?1, expires_at = ?2
+             WHERE canonical_workspace = ?3 AND session_id = ?4",
+            params![now.to_rfc3339(), expires, canonical_workspace, session_id],
+        )?;
+        Ok(updated > 0)
+    }
+
+    /// Release a lease held by a session.
+    pub fn release_lease(
+        &self,
+        canonical_workspace: &str,
+        session_id: &str,
+    ) -> Result<bool, StorageError> {
+        let deleted = self.conn.execute(
+            "DELETE FROM workspace_leases WHERE canonical_workspace = ?1 AND session_id = ?2",
+            params![canonical_workspace, session_id],
+        )?;
+        Ok(deleted > 0)
+    }
+
+    /// Current lease holder for a workspace.
+    pub fn lease_holder(
+        &self,
+        canonical_workspace: &str,
+    ) -> Result<Option<WorkspaceLease>, StorageError> {
+        self.conn
+            .query_row(
+                "SELECT canonical_workspace, session_id, acquired_at, heartbeat_at, expires_at
+                 FROM workspace_leases WHERE canonical_workspace = ?1",
+                params![canonical_workspace],
+                |row| {
+                    Ok(WorkspaceLease {
+                        canonical_workspace: row.get(0)?,
+                        session_id: row.get(1)?,
+                        acquired_at: row.get(2)?,
+                        heartbeat_at: row.get(3)?,
+                        expires_at: row.get(4)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Persist a pending approval.
+    pub fn insert_pending_approval(
+        &self,
+        approval_id: &str,
+        session_id: &str,
+        action: &serde_json::Value,
+    ) -> Result<(), StorageError> {
+        self.conn.execute(
+            "INSERT INTO approvals (
+                approval_id, session_id, action_hash, status, action_json, created_at
+             ) VALUES (?1, ?2, '', 'pending', ?3, ?4)",
+            params![
+                approval_id,
+                session_id,
+                serde_json::to_string(action)?,
+                Utc::now().to_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Resolve a pending approval.
+    pub fn resolve_approval(
+        &self,
+        approval_id: &str,
+        decision: &str,
+        reason: Option<&str>,
+    ) -> Result<bool, StorageError> {
+        let status = if decision == "allow" {
+            "allowed"
+        } else {
+            "denied"
+        };
+        let updated = self.conn.execute(
+            "UPDATE approvals SET status = ?1, decision = ?2, resolved_at = ?3
+             WHERE approval_id = ?4 AND status = 'pending'",
+            params![status, decision, Utc::now().to_rfc3339(), approval_id],
+        )?;
+        let _ = reason;
+        Ok(updated > 0)
+    }
+
+    /// List pending approvals for a session.
+    pub fn pending_approvals(&self, session_id: &str) -> Result<Vec<ApprovalInfo>, StorageError> {
+        let mut statement = self.conn.prepare(
+            "SELECT approval_id, session_id, action_json, created_at
+             FROM approvals WHERE session_id = ?1 AND status = 'pending'
+             ORDER BY created_at ASC",
+        )?;
+        let rows = statement.query_map(params![session_id], |row| {
+            let action_json: String = row.get(2)?;
+            Ok(ApprovalInfo {
+                approval_id: row.get(0)?,
+                session_id: row.get(1)?,
+                action: serde_json::from_str(&action_json).unwrap_or(serde_json::Value::Null),
+                created_at: row.get(3)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 
     /// Append one event and return it with its assigned sequence number.
@@ -515,6 +814,150 @@ impl StorageHandle {
             .await
     }
 
+    /// List sessions, optionally including archived ones.
+    pub async fn list_sessions_with_archived(
+        &self,
+        include_archived: bool,
+    ) -> Result<Vec<SessionInfo>, StorageError> {
+        self.with(move |storage| storage.list_sessions_with_archived(include_archived))
+            .await
+    }
+
+    /// Rename a session.
+    pub async fn rename_session(
+        &self,
+        session_id: String,
+        name: String,
+    ) -> Result<SessionInfo, StorageError> {
+        self.with(move |storage| storage.rename_session(&session_id, &name))
+            .await
+    }
+
+    /// Archive a session.
+    pub async fn archive_session(&self, session_id: String) -> Result<SessionInfo, StorageError> {
+        self.with(move |storage| storage.archive_session(&session_id))
+            .await
+    }
+
+    /// Soft-delete a session.
+    pub async fn delete_session(&self, session_id: String) -> Result<bool, StorageError> {
+        self.with(move |storage| storage.delete_session(&session_id))
+            .await
+    }
+
+    /// Update a session model policy.
+    pub async fn update_session_model_policy(
+        &self,
+        session_id: String,
+        policy: serde_json::Value,
+    ) -> Result<SessionInfo, StorageError> {
+        self.with(move |storage| storage.update_session_model_policy(&session_id, &policy))
+            .await
+    }
+
+    /// Add turn usage to the session totals.
+    pub async fn record_session_usage(
+        &self,
+        session_id: String,
+        input_tokens: u64,
+        output_tokens: u64,
+        cost_usd: f64,
+    ) -> Result<SessionInfo, StorageError> {
+        self.with(move |storage| {
+            storage.record_session_usage(&session_id, input_tokens, output_tokens, cost_usd)
+        })
+        .await
+    }
+
+    /// Update the session default model column.
+    pub async fn update_session_model(
+        &self,
+        session_id: String,
+        model: String,
+    ) -> Result<SessionInfo, StorageError> {
+        self.with(move |storage| storage.update_session_model(&session_id, &model))
+            .await
+    }
+
+    /// Acquire or refresh a workspace lease.
+    pub async fn acquire_lease(
+        &self,
+        canonical_workspace: String,
+        session_id: String,
+        ttl_secs: u64,
+        steal: bool,
+    ) -> Result<Option<WorkspaceLease>, StorageError> {
+        self.with(move |storage| {
+            storage.acquire_lease(&canonical_workspace, &session_id, ttl_secs, steal)
+        })
+        .await
+    }
+
+    /// Renew a workspace lease.
+    pub async fn renew_lease(
+        &self,
+        canonical_workspace: String,
+        session_id: String,
+        ttl_secs: u64,
+    ) -> Result<bool, StorageError> {
+        self.with(move |storage| storage.renew_lease(&canonical_workspace, &session_id, ttl_secs))
+            .await
+    }
+
+    /// Release a workspace lease.
+    pub async fn release_lease(
+        &self,
+        canonical_workspace: String,
+        session_id: String,
+    ) -> Result<bool, StorageError> {
+        self.with(move |storage| storage.release_lease(&canonical_workspace, &session_id))
+            .await
+    }
+
+    /// Current lease holder.
+    pub async fn lease_holder(
+        &self,
+        canonical_workspace: String,
+    ) -> Result<Option<WorkspaceLease>, StorageError> {
+        self.with(move |storage| storage.lease_holder(&canonical_workspace))
+            .await
+    }
+
+    /// Persist a pending approval.
+    pub async fn insert_pending_approval(
+        &self,
+        approval_id: String,
+        session_id: String,
+        action: serde_json::Value,
+    ) -> Result<(), StorageError> {
+        self.with(move |storage| {
+            storage.insert_pending_approval(&approval_id, &session_id, &action)
+        })
+        .await
+    }
+
+    /// Resolve a pending approval.
+    pub async fn resolve_approval(
+        &self,
+        approval_id: String,
+        decision: String,
+        reason: Option<String>,
+    ) -> Result<bool, StorageError> {
+        self.with(move |storage| {
+            storage.resolve_approval(&approval_id, &decision, reason.as_deref())
+        })
+        .await
+    }
+
+    /// List pending approvals.
+    pub async fn pending_approvals(
+        &self,
+        session_id: String,
+    ) -> Result<Vec<ApprovalInfo>, StorageError> {
+        self.with(move |storage| storage.pending_approvals(&session_id))
+            .await
+    }
+
     /// Append one event.
     pub async fn append_event(&self, event: NewEvent) -> Result<EventEnvelope, StorageError> {
         self.with(move |storage| storage.append_event(event)).await
@@ -600,9 +1043,14 @@ impl StorageHandle {
 
 struct SessionRow {
     session_id: String,
+    name: String,
     workspace: String,
     mode: String,
     model: String,
+    model_policy_json: String,
+    input_tokens: u64,
+    output_tokens: u64,
+    cost_usd: f64,
     status: String,
     created_at: String,
     updated_at: String,
@@ -612,21 +1060,31 @@ impl SessionRow {
     fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
         Ok(Self {
             session_id: row.get(0)?,
-            workspace: row.get(1)?,
-            mode: row.get(2)?,
-            model: row.get(3)?,
-            status: row.get(4)?,
-            created_at: row.get(5)?,
-            updated_at: row.get(6)?,
+            name: row.get(1)?,
+            workspace: row.get(2)?,
+            mode: row.get(3)?,
+            model: row.get(4)?,
+            model_policy_json: row.get(5)?,
+            input_tokens: row.get::<_, i64>(6)? as u64,
+            output_tokens: row.get::<_, i64>(7)? as u64,
+            cost_usd: row.get(8)?,
+            status: row.get(9)?,
+            created_at: row.get(10)?,
+            updated_at: row.get(11)?,
         })
     }
 
     fn into_session(self) -> Result<SessionInfo, StorageError> {
         Ok(SessionInfo {
             session_id: self.session_id,
+            name: self.name,
             workspace: self.workspace,
             mode: SessionMode::parse(&self.mode)?,
             model: self.model,
+            model_policy: serde_json::from_str(&self.model_policy_json)?,
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+            cost_usd: self.cost_usd,
             status: SessionStatus::parse(&self.status)?,
             created_at: self.created_at,
             updated_at: self.updated_at,
@@ -785,5 +1243,24 @@ CREATE TABLE IF NOT EXISTS workspace_trust (
     created_at TEXT NOT NULL,
     last_used_at TEXT NOT NULL,
     PRIMARY KEY (canonical_path, config_hash)
+);
+"#;
+
+const MIGRATION_2: &str = r#"
+ALTER TABLE sessions ADD COLUMN name TEXT NOT NULL DEFAULT '';
+ALTER TABLE sessions ADD COLUMN model_policy_json TEXT NOT NULL DEFAULT '{}';
+ALTER TABLE sessions ADD COLUMN deleted_at TEXT;
+UPDATE sessions SET name = session_id WHERE name = '';
+ALTER TABLE sessions ADD COLUMN input_tokens INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE sessions ADD COLUMN output_tokens INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE sessions ADD COLUMN cost_usd REAL NOT NULL DEFAULT 0;
+ALTER TABLE approvals ADD COLUMN action_json TEXT;
+
+CREATE TABLE IF NOT EXISTS workspace_leases (
+    canonical_workspace TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    acquired_at TEXT NOT NULL,
+    heartbeat_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL
 );
 "#;

@@ -1,0 +1,15 @@
+# Copy to ~/.config/thais/models.toml to override catalog metadata.
+
+[[models]]
+id = "gpt-4.1"
+context_window = 1047576
+supports_tools = true
+input_cost_per_million = 2.00
+output_cost_per_million = 8.00
+
+[[models]]
+id = "claude-sonnet-4-5"
+context_window = 200000
+supports_tools = true
+input_cost_per_million = 3.00
+output_cost_per_million = 15.00

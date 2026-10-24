@@ -12,9 +12,14 @@ fn session(workspace: &Path) -> SessionInfo {
     let now = "2026-10-23T00:00:00Z".to_owned();
     SessionInfo {
         session_id: "s-1".to_owned(),
+        name: "s-1".to_owned(),
         workspace: workspace.to_string_lossy().into_owned(),
         mode: SessionMode::Build,
         model: "fake".to_owned(),
+        model_policy: serde_json::json!({"default": "fake"}),
+        input_tokens: 0,
+        output_tokens: 0,
+        cost_usd: 0.0,
         status: SessionStatus::Active,
         created_at: now.clone(),
         updated_at: now,
@@ -202,7 +207,7 @@ fn trust_is_keyed_by_path_and_config_hash() {
 fn schema_version_and_integrity() {
     let temp = tempfile::tempdir().expect("temp");
     let storage = open(&temp);
-    assert_eq!(storage.schema_version().expect("version"), 1);
+    assert_eq!(storage.schema_version().expect("version"), 2);
     assert_eq!(storage.integrity_check().expect("integrity"), "ok");
 }
 

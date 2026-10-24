@@ -46,6 +46,8 @@ pub enum SessionStatus {
     Active,
     /// Session is archived and read-only.
     Archived,
+    /// Session was soft-deleted.
+    Deleted,
     /// Session finished successfully.
     Completed,
     /// Session failed.
@@ -61,6 +63,7 @@ impl SessionStatus {
         match self {
             Self::Active => "active",
             Self::Archived => "archived",
+            Self::Deleted => "deleted",
             Self::Completed => "completed",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
@@ -72,6 +75,7 @@ impl SessionStatus {
         match value {
             "active" => Ok(Self::Active),
             "archived" => Ok(Self::Archived),
+            "deleted" => Ok(Self::Deleted),
             "completed" => Ok(Self::Completed),
             "failed" => Ok(Self::Failed),
             "cancelled" => Ok(Self::Cancelled),
@@ -83,16 +87,31 @@ impl SessionStatus {
 }
 
 /// Public session metadata.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionInfo {
     /// Stable session identifier.
     pub session_id: String,
+    /// Human-readable session name.
+    #[serde(default)]
+    pub name: String,
     /// Workspace path supplied at creation.
     pub workspace: String,
     /// Active mode.
     pub mode: SessionMode,
-    /// Selected model identifier.
+    /// Selected default model identifier.
     pub model: String,
+    /// Role-based model policy.
+    #[serde(default)]
+    pub model_policy: serde_json::Value,
+    /// Cumulative input tokens for the session.
+    #[serde(default)]
+    pub input_tokens: u64,
+    /// Cumulative output tokens for the session.
+    #[serde(default)]
+    pub output_tokens: u64,
+    /// Cumulative cost in USD for the session.
+    #[serde(default)]
+    pub cost_usd: f64,
     /// Lifecycle state.
     pub status: SessionStatus,
     /// RFC 3339 creation timestamp.
@@ -136,12 +155,18 @@ pub struct InitializeResult {
 pub struct SessionCreateParams {
     /// Workspace root.
     pub workspace: String,
+    /// Optional session name.
+    #[serde(default)]
+    pub name: Option<String>,
     /// Initial mode.
     #[serde(default)]
     pub mode: SessionMode,
     /// Optional model override.
     #[serde(default)]
     pub model: Option<String>,
+    /// Take over an existing mutating lease after confirmation.
+    #[serde(default)]
+    pub steal_lease: bool,
 }
 
 /// Result of `session.create`.
@@ -161,6 +186,9 @@ pub struct SessionSendParams {
     /// Optional client-supplied turn identifier.
     #[serde(default)]
     pub turn_id: Option<String>,
+    /// Optional per-turn model override.
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 /// Result of `session.send`.
@@ -239,4 +267,166 @@ pub struct SessionSubscribeResult {
 pub struct SessionEventParams {
     /// Event payload.
     pub event: EventEnvelope,
+}
+
+/// Parameters for `session.list`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SessionListParams {
+    /// Include archived sessions.
+    #[serde(default)]
+    pub include_archived: bool,
+}
+
+/// Result of `session.list`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionListResult {
+    /// Matching sessions.
+    pub sessions: Vec<SessionInfo>,
+}
+
+/// Parameters for `session.get`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionGetParams {
+    /// Target session.
+    pub session_id: String,
+}
+
+/// Result of `session.get`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionGetResult {
+    /// Session metadata.
+    pub session: SessionInfo,
+}
+
+/// Parameters for `session.rename`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionRenameParams {
+    /// Target session.
+    pub session_id: String,
+    /// New name.
+    pub name: String,
+}
+
+/// Result of `session.rename`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionRenameResult {
+    /// Updated session.
+    pub session: SessionInfo,
+}
+
+/// Parameters for `session.archive`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionArchiveParams {
+    /// Target session.
+    pub session_id: String,
+}
+
+/// Result of `session.archive`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionArchiveResult {
+    /// Updated session.
+    pub session: SessionInfo,
+}
+
+/// Parameters for `session.delete`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionDeleteParams {
+    /// Target session.
+    pub session_id: String,
+}
+
+/// Result of `session.delete`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionDeleteResult {
+    /// Whether the session was soft-deleted.
+    pub deleted: bool,
+}
+
+/// Parameters for `session.resume`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionResumeParams {
+    /// Target session.
+    pub session_id: String,
+}
+
+/// A durable pending approval.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApprovalInfo {
+    /// Approval identifier.
+    pub approval_id: String,
+    /// Session identifier.
+    pub session_id: String,
+    /// Action JSON.
+    pub action: serde_json::Value,
+    /// RFC 3339 creation timestamp.
+    pub created_at: String,
+}
+
+/// Checkpoint summary returned on resume.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CheckpointSummary {
+    /// Current loop state.
+    #[serde(default)]
+    pub state: String,
+    /// Approved plan, when present.
+    #[serde(default)]
+    pub plan: Option<String>,
+    /// Derived task list.
+    #[serde(default)]
+    pub tasks: Vec<String>,
+}
+
+/// Result of `session.resume`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionResumeResult {
+    /// Restored session.
+    pub session: SessionInfo,
+    /// Checkpoint summary, when present.
+    #[serde(default)]
+    pub checkpoint: Option<CheckpointSummary>,
+    /// Pending approvals still open.
+    #[serde(default)]
+    pub pending_approvals: Vec<ApprovalInfo>,
+}
+
+/// Parameters for `session.set_model`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionSetModelParams {
+    /// Target session.
+    pub session_id: String,
+    /// Role name: `default`, `plan`, `build`, `explore`, `general`, or `compact`.
+    pub role: String,
+    /// Model identifier.
+    pub model: String,
+}
+
+/// Result of `session.set_model`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionSetModelResult {
+    /// Updated session.
+    pub session: SessionInfo,
+}
+
+/// A model catalog entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelInfo {
+    /// Model identifier.
+    pub id: String,
+    /// Provider identifier.
+    pub provider: String,
+    /// Maximum context window.
+    pub context_window: u64,
+    /// Whether the model supports tool calling.
+    pub supports_tools: bool,
+    /// Input cost per million tokens.
+    pub input_cost_per_million: f64,
+    /// Output cost per million tokens.
+    pub output_cost_per_million: f64,
+}
+
+/// Result of `models.list`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelsListResult {
+    /// Available models.
+    pub models: Vec<ModelInfo>,
 }

@@ -24,8 +24,9 @@ use thais_protocol::event::{EventEnvelope, EventKind};
 use thais_protocol::jsonrpc::Notification;
 use thais_protocol::method;
 use thais_protocol::session::{
-    ApprovalDecision, InitializeParams, SessionApproveParams, SessionCancelParams,
-    SessionCreateParams, SessionInfo, SessionMode, SessionSendParams, SessionSubscribeParams,
+    ApprovalDecision, InitializeParams, SessionApproveParams, SessionArchiveParams,
+    SessionCancelParams, SessionCreateParams, SessionDeleteParams, SessionInfo, SessionListParams,
+    SessionMode, SessionResumeParams, SessionSendParams, SessionSubscribeParams,
 };
 use thais_sdk::{Client, Transport};
 use tokio::sync::mpsc;
@@ -50,8 +51,10 @@ pub async fn run<T: Transport + 'static>(
     let created = client
         .session_create(SessionCreateParams {
             workspace,
+            name: None,
             mode,
             model,
+            steal_lease: false,
         })
         .await
         .context("session.create")?;
@@ -79,6 +82,13 @@ pub async fn run<T: Transport + 'static>(
     result
 }
 
+#[derive(Clone, Default)]
+struct UsageView {
+    input_tokens: u64,
+    output_tokens: u64,
+    cost_usd: f64,
+}
+
 #[derive(Clone)]
 struct PendingApproval {
     approval_id: String,
@@ -88,6 +98,7 @@ struct PendingApproval {
 
 struct AppState {
     session_id: String,
+    session_name: String,
     mode: String,
     model: String,
     transcript: String,
@@ -95,6 +106,9 @@ struct AppState {
     input: String,
     status: String,
     pending: Option<PendingApproval>,
+    usage: UsageView,
+    sessions: Vec<SessionInfo>,
+    picker: Option<usize>,
     streaming: bool,
     auto_scroll: bool,
     scroll: u16,
@@ -105,6 +119,7 @@ impl AppState {
     fn new(session: SessionInfo) -> Self {
         Self {
             session_id: session.session_id,
+            session_name: session.name,
             mode: match session.mode {
                 SessionMode::Plan => "plan".to_owned(),
                 SessionMode::Build => "build".to_owned(),
@@ -115,6 +130,13 @@ impl AppState {
             input: String::new(),
             status: "ready".to_owned(),
             pending: None,
+            usage: UsageView {
+                input_tokens: session.input_tokens,
+                output_tokens: session.output_tokens,
+                cost_usd: session.cost_usd,
+            },
+            sessions: Vec::new(),
+            picker: None,
             streaming: false,
             auto_scroll: true,
             scroll: 0,
@@ -132,6 +154,9 @@ impl AppState {
         let Ok(event) = serde_json::from_value::<EventEnvelope>(value.clone()) else {
             return;
         };
+        if event.session_id != self.session_id {
+            return;
+        }
 
         match event.kind {
             EventKind::ModelDelta => {
@@ -243,6 +268,20 @@ impl AppState {
                 self.streaming = false;
                 self.transcript.push('\n');
                 self.status = "ready".to_owned();
+                if let Some(usage) = event.payload.get("session_usage") {
+                    self.usage.input_tokens = usage
+                        .get("input_tokens")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    self.usage.output_tokens = usage
+                        .get("output_tokens")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    self.usage.cost_usd = usage
+                        .get("cost_usd")
+                        .and_then(serde_json::Value::as_f64)
+                        .unwrap_or(0.0);
+                }
             }
             EventKind::TurnCancelled => {
                 self.streaming = false;
@@ -288,6 +327,26 @@ impl AppState {
                 self.status = "unverified".to_owned();
             }
             EventKind::SessionCreated | EventKind::TurnStarted => {}
+            EventKind::ModelChanged => {
+                if let Some(model) = event
+                    .payload
+                    .get("model")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    self.model = model.to_owned();
+                }
+                self.status = "model changed".to_owned();
+            }
+            EventKind::BudgetWarning => {
+                let budget = event
+                    .payload
+                    .get("budget")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("budget");
+                self.transcript
+                    .push_str(&format!("\n[{budget} budget warning]\n"));
+                self.status = "budget warning".to_owned();
+            }
         }
     }
 }
@@ -352,6 +411,21 @@ async fn handle_key<T: Transport>(
         app.should_quit = true;
         return Ok(());
     }
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
+        app.sessions = client
+            .session_list(SessionListParams {
+                include_archived: true,
+            })
+            .await?
+            .sessions;
+        app.picker = Some(0);
+        app.status = "sessions".to_owned();
+        return Ok(());
+    }
+
+    if app.picker.is_some() {
+        return handle_picker_key(app, key, client).await;
+    }
 
     if let Some(pending) = app.pending.clone() {
         let decision = match key.code {
@@ -388,6 +462,7 @@ async fn handle_key<T: Transport>(
                     session_id: app.session_id.clone(),
                     input: task,
                     turn_id: None,
+                    model: None,
                 })
                 .await
             {
@@ -428,6 +503,112 @@ async fn handle_key<T: Transport>(
     Ok(())
 }
 
+async fn handle_picker_key<T: Transport>(
+    app: &mut AppState,
+    key: crossterm::event::KeyEvent,
+    client: &Client<T>,
+) -> Result<()> {
+    let Some(mut selected) = app.picker else {
+        return Ok(());
+    };
+    match key.code {
+        KeyCode::Esc => {
+            app.picker = None;
+            app.status = "ready".to_owned();
+        }
+        KeyCode::Up => {
+            selected = selected.saturating_sub(1);
+            app.picker = Some(selected);
+        }
+        KeyCode::Down => {
+            if selected + 1 < app.sessions.len() {
+                selected += 1;
+            }
+            app.picker = Some(selected);
+        }
+        KeyCode::Enter => {
+            let Some(session) = app.sessions.get(selected).cloned() else {
+                return Ok(());
+            };
+            let resumed = client
+                .session_resume(SessionResumeParams {
+                    session_id: session.session_id.clone(),
+                })
+                .await?;
+            app.session_id = resumed.session.session_id.clone();
+            app.session_name = resumed.session.name.clone();
+            app.mode = resumed.session.mode.as_str().to_owned();
+            app.model = resumed.session.model.clone();
+            app.transcript.clear();
+            app.reasoning.clear();
+            app.usage = UsageView {
+                input_tokens: resumed.session.input_tokens,
+                output_tokens: resumed.session.output_tokens,
+                cost_usd: resumed.session.cost_usd,
+            };
+            app.pending = None;
+            app.streaming = false;
+            app.auto_scroll = true;
+            app.scroll = 0;
+            app.picker = None;
+            app.status = "resumed".to_owned();
+            if let Some(approval) = resumed.pending_approvals.first() {
+                app.pending = Some(PendingApproval {
+                    approval_id: approval.approval_id.clone(),
+                    action: serde_json::to_string_pretty(&approval.action)
+                        .unwrap_or_else(|_| approval.action.to_string()),
+                    diff: None,
+                });
+                app.status = "pending approval".to_owned();
+            }
+            client
+                .session_subscribe(SessionSubscribeParams {
+                    session_id: resumed.session.session_id,
+                    from_seq: Some(0),
+                })
+                .await?;
+        }
+        KeyCode::Char('a') => {
+            let Some(session) = app.sessions.get(selected).cloned() else {
+                return Ok(());
+            };
+            client
+                .session_archive(SessionArchiveParams {
+                    session_id: session.session_id.clone(),
+                })
+                .await?;
+            app.sessions = client
+                .session_list(SessionListParams {
+                    include_archived: true,
+                })
+                .await?
+                .sessions;
+            app.picker = Some(selected.min(app.sessions.len().saturating_sub(1)));
+            app.status = "archived".to_owned();
+        }
+        KeyCode::Char('x') => {
+            let Some(session) = app.sessions.get(selected).cloned() else {
+                return Ok(());
+            };
+            client
+                .session_delete(SessionDeleteParams {
+                    session_id: session.session_id.clone(),
+                })
+                .await?;
+            app.sessions = client
+                .session_list(SessionListParams {
+                    include_archived: true,
+                })
+                .await?
+                .sessions;
+            app.picker = Some(selected.min(app.sessions.len().saturating_sub(1)));
+            app.status = "deleted".to_owned();
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 fn draw_ui(frame: &mut Frame<'_>, app: &AppState) {
     let area = frame.area();
     let chunks = Layout::default()
@@ -458,10 +639,14 @@ fn draw_ui(frame: &mut Frame<'_>, app: &AppState) {
     frame.render_widget(input, chunks[1]);
 
     let status = format!(
-        "{} | mode: {} | model: {} | {}",
+        "{} {} | {} | {} | tok {}/{} ${:.4} | {}",
         short_id(&app.session_id),
+        truncate(&app.session_name, 24),
         app.mode,
         app.model,
+        app.usage.input_tokens,
+        app.usage.output_tokens,
+        app.usage.cost_usd,
         app.status
     );
     let status = Paragraph::new(Line::from(Span::styled(
@@ -469,6 +654,35 @@ fn draw_ui(frame: &mut Frame<'_>, app: &AppState) {
         Style::default().fg(Color::Black).bg(Color::Cyan),
     )));
     frame.render_widget(status, chunks[2]);
+
+    if let Some(selected) = app.picker {
+        let area = centered_rect(80, 60, area);
+        frame.render_widget(Clear, area);
+        let lines = app
+            .sessions
+            .iter()
+            .enumerate()
+            .map(|(index, session)| {
+                let marker = if index == selected { ">" } else { " " };
+                Line::from(format!(
+                    "{marker} {}  {}  {}  {}  {}",
+                    short_id(&session.session_id),
+                    truncate(&session.name, 28),
+                    session.mode.as_str(),
+                    session.status.as_str(),
+                    session.model
+                ))
+            })
+            .collect::<Vec<_>>();
+        let modal = Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Sessions  [enter] resume  [a] archive  [x] delete  [esc] close"),
+            )
+            .wrap(Wrap { trim: false });
+        frame.render_widget(modal, area);
+    }
 
     if let Some(pending) = &app.pending {
         let area = centered_rect(75, 30, area);
@@ -568,9 +782,14 @@ mod tests {
     fn session() -> SessionInfo {
         SessionInfo {
             session_id: "session_1234567890".to_owned(),
+            name: "test".to_owned(),
             workspace: "/tmp".to_owned(),
             mode: SessionMode::Build,
             model: "command-a-plus-05-2026".to_owned(),
+            model_policy: json!({"default": "command-a-plus-05-2026"}),
+            input_tokens: 0,
+            output_tokens: 0,
+            cost_usd: 0.0,
             status: thais_protocol::session::SessionStatus::Active,
             created_at: "2026-10-23T00:00:00Z".to_owned(),
             updated_at: "2026-10-23T00:00:00Z".to_owned(),
@@ -663,8 +882,27 @@ mod tests {
     }
 
     #[test]
+    fn draw_ui_renders_the_session_picker() {
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut app = AppState::new(session());
+        app.sessions = vec![session()];
+        app.picker = Some(0);
+        terminal.draw(|frame| draw_ui(frame, &app)).expect("draw");
+        let content = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(content.contains("Sessions"));
+        assert!(content.contains("resume"));
+    }
+
+    #[test]
     fn draw_ui_renders_the_status_bar() {
-        let backend = TestBackend::new(80, 24);
+        let backend = TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend).expect("terminal");
         let app = AppState::new(session());
         terminal.draw(|frame| draw_ui(frame, &app)).expect("draw");
@@ -675,6 +913,7 @@ mod tests {
             .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
         assert!(content.contains("Thais"));
-        assert!(content.contains("mode: build"));
+        assert!(content.contains("build"));
+        assert!(content.contains("command-a-plus"));
     }
 }

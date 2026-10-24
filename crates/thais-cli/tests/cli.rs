@@ -84,7 +84,7 @@ fn doctor_reports_paths_and_fts5() {
 
     let stdout = String::from_utf8(output.stdout).expect("stdout");
     assert!(stdout.contains("SQLite FTS5 available"), "{stdout}");
-    assert!(stdout.contains("schema version: 1"), "{stdout}");
+    assert!(stdout.contains("schema version: 2"), "{stdout}");
     assert!(
         stdout.contains(temp.path().to_string_lossy().as_ref()),
         "{stdout}"
@@ -243,4 +243,67 @@ fn trust_round_trip_invalidates_on_config_change() {
             .expect("stdout")
             .contains("trusted: false")
     );
+}
+
+#[test]
+fn sessions_and_models_commands_report_persisted_state() {
+    let temp = tempfile::tempdir().expect("temp");
+    let mut command = Command::new(binary());
+    with_xdg(&mut command, temp.path());
+    let output = command
+        .args(["run", "--task", "hello", "--json"])
+        .output()
+        .expect("run");
+    assert!(output.status.success());
+
+    let mut command = Command::new(binary());
+    with_xdg(&mut command, temp.path());
+    let output = command
+        .args(["sessions", "--all"])
+        .output()
+        .expect("sessions");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout");
+    assert!(stdout.contains("fake-model"), "{stdout}");
+    assert!(stdout.contains("active"), "{stdout}");
+
+    let config = temp.path().join("config").join("thais");
+    std::fs::create_dir_all(&config).expect("config");
+    std::fs::write(
+        config.join("providers.toml"),
+        r#"
+        [[providers]]
+        id = "fake"
+        type = "fake"
+        models = ["fake-model"]
+        "#,
+    )
+    .expect("providers");
+    std::fs::write(
+        config.join("models.toml"),
+        r#"
+        [[models]]
+        id = "fake-model"
+        context_window = 1234
+        supports_tools = true
+        input_cost_per_million = 1.0
+        output_cost_per_million = 2.0
+        "#,
+    )
+    .expect("models");
+    let mut command = Command::new(binary());
+    with_xdg(&mut command, temp.path());
+    let output = command.arg("models").output().expect("models");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout");
+    assert!(stdout.contains("fake-model"), "{stdout}");
+    assert!(stdout.contains("context=1234"), "{stdout}");
 }

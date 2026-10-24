@@ -104,8 +104,10 @@ async fn sdk_client_drives_the_runtime_through_the_in_process_bridge() {
     let session = client
         .session_create(SessionCreateParams {
             workspace: temp.path().to_string_lossy().into_owned(),
+            name: None,
             mode: SessionMode::Build,
             model: None,
+            steal_lease: false,
         })
         .await
         .expect("session")
@@ -116,6 +118,7 @@ async fn sdk_client_drives_the_runtime_through_the_in_process_bridge() {
             session_id: session.session_id.clone(),
             input: "hello".to_owned(),
             turn_id: None,
+            model: None,
         })
         .await
         .expect("send");

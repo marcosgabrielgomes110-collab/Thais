@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand, ValueEnum};
-use thais_core::{ContextManager, Runtime, SystemClock, UuidGenerator, Verifier};
+use thais_core::{ContextManager, ProviderRegistry, Runtime, SystemClock, UuidGenerator, Verifier};
 use thais_protocol::event::{EventEnvelope, EventKind};
 use thais_protocol::jsonrpc::{Message, Notification};
 use thais_protocol::method;
@@ -87,6 +87,14 @@ enum Command {
         #[arg(long)]
         workspace: Option<PathBuf>,
     },
+    /// List persisted sessions.
+    Sessions {
+        /// Include archived sessions.
+        #[arg(long)]
+        all: bool,
+    },
+    /// List models from providers.toml/models.toml.
+    Models,
     /// Validate paths, permissions, credentials, and SQLite FTS5.
     Doctor,
     /// Manage provider credentials.
@@ -111,6 +119,41 @@ enum ProviderChoice {
     Fake,
     /// Cohere through the OpenAI-compatible Compatibility API.
     Cohere,
+    /// Native OpenAI.
+    Openai,
+    /// Native Anthropic Messages API.
+    Anthropic,
+    /// OpenRouter.
+    Openrouter,
+    /// DeepSeek.
+    Deepseek,
+    /// Alibaba Qwen (DashScope compatible mode).
+    Qwen,
+    /// Z.ai.
+    Zai,
+    /// Local Ollama.
+    Ollama,
+    /// Local vLLM.
+    Vllm,
+    /// Local LiteLLM proxy.
+    Litellm,
+}
+
+impl ProviderChoice {
+    const fn preset_id(self) -> Option<&'static str> {
+        match self {
+            Self::Fake | Self::Cohere => None,
+            Self::Openai => Some("openai"),
+            Self::Anthropic => Some("anthropic"),
+            Self::Openrouter => Some("openrouter"),
+            Self::Deepseek => Some("deepseek"),
+            Self::Qwen => Some("qwen"),
+            Self::Zai => Some("zai"),
+            Self::Ollama => Some("ollama"),
+            Self::Vllm => Some("vllm"),
+            Self::Litellm => Some("litellm"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -207,10 +250,63 @@ async fn main() -> anyhow::Result<()> {
             )
             .await
         }
+        Command::Sessions { all } => sessions(all).await,
+        Command::Models => models().await,
         Command::Doctor => doctor(),
         Command::Auth { command } => auth(command),
         Command::Trust { status, remove } => trust(status, remove),
     }
+}
+
+async fn sessions(all: bool) -> anyhow::Result<()> {
+    let paths = Paths::discover()?;
+    paths.ensure()?;
+    let storage = StorageHandle::open(paths.database_path())?;
+    let sessions = storage.list_sessions_with_archived(all).await?;
+    if sessions.is_empty() {
+        println!("no sessions");
+        return Ok(());
+    }
+    for session in sessions {
+        println!(
+            "{}\t{}\t{}\t{}\t{}\ttok={}/{}\t${:.4}\t{}",
+            session.session_id,
+            session.name,
+            session.mode.as_str(),
+            session.status.as_str(),
+            session.model,
+            session.input_tokens,
+            session.output_tokens,
+            session.cost_usd,
+            session.workspace
+        );
+    }
+    Ok(())
+}
+
+async fn models() -> anyhow::Result<()> {
+    let paths = Paths::discover()?;
+    paths.ensure()?;
+    let registry = ProviderRegistry::load(&paths)?;
+    if registry.is_empty() {
+        println!(
+            "no providers configured; add providers.toml under {}",
+            paths.config_dir().display()
+        );
+        return Ok(());
+    }
+    for model in registry.models().await? {
+        println!(
+            "{}\t{}\tcontext={}\ttools={}\tin=${:.2}/M\tout=${:.2}/M",
+            model.id,
+            model.provider,
+            model.context_window,
+            model.supports_tools,
+            model.input_cost_per_million,
+            model.output_cost_per_million
+        );
+    }
+    Ok(())
 }
 
 fn build_runtime(
@@ -221,40 +317,98 @@ fn build_runtime(
     let paths = Paths::discover()?;
     paths.ensure()?;
     let storage = StorageHandle::open(paths.database_path())?;
-
-    let provider: Arc<dyn Provider> = match provider.unwrap_or(ProviderChoice::Fake) {
-        ProviderChoice::Fake => {
-            let script = match fake {
-                Some(path) => FakeScript::from_file(&path)
-                    .with_context(|| format!("could not load fake script {}", path.display()))?,
-                None => FakeScript {
-                    model: Some(model.unwrap_or_else(|| "fake-model".to_owned())),
-                    steps: vec![FakeStep::Text {
-                        text: "M0 fake provider ready.".to_owned(),
-                    }],
-                },
-            };
-            Arc::new(FakeProvider::new("fake", script))
-        }
-        ProviderChoice::Cohere => {
-            let key = std::env::var("THAIS_COHERE_API_KEY")
-                .or_else(|_| std::env::var("COHERE_API_KEY"))
-                .context("set THAIS_COHERE_API_KEY or COHERE_API_KEY for `--provider cohere`")?;
-            let model = model.unwrap_or_else(|| COHERE_DEFAULT_MODEL.to_owned());
-            Arc::new(OpenAiCompatibleProvider::cohere(key, model)?)
-        }
+    let use_config = provider.is_none() && fake.is_none();
+    let choice = provider.unwrap_or(ProviderChoice::Fake);
+    let configured = if use_config {
+        let registry = ProviderRegistry::load(&paths)?;
+        (!registry.is_empty()).then_some(registry)
+    } else {
+        None
     };
 
-    Ok(Arc::new(
-        Runtime::new(
+    let runtime = if let Some(registry) = configured {
+        Runtime::with_registry(
             storage,
-            provider,
+            Arc::new(registry),
             Arc::new(SystemClock),
             Arc::new(UuidGenerator),
             ContextManager::new(paths.clone()),
         )
-        .with_snapshot_base(paths.snapshots_dir())
-        .with_verifier(Verifier::load(&paths.config_file("verifier.toml"))?),
+    } else {
+        match choice {
+            ProviderChoice::Fake => {
+                let script = match fake {
+                    Some(path) => FakeScript::from_file(&path).with_context(|| {
+                        format!("could not load fake script {}", path.display())
+                    })?,
+                    None => FakeScript {
+                        model: Some(model.unwrap_or_else(|| "fake-model".to_owned())),
+                        steps: vec![FakeStep::Text {
+                            text: "M0 fake provider ready.".to_owned(),
+                        }],
+                    },
+                };
+                let provider: Arc<dyn Provider> = Arc::new(FakeProvider::new("fake", script));
+                Runtime::new(
+                    storage,
+                    provider,
+                    Arc::new(SystemClock),
+                    Arc::new(UuidGenerator),
+                    ContextManager::new(paths.clone()),
+                )
+            }
+            ProviderChoice::Cohere => {
+                if let Ok(registry) = ProviderRegistry::preset(
+                    &paths,
+                    "cohere",
+                    model.clone(),
+                    serde_json::Value::Null,
+                ) {
+                    Runtime::with_registry(
+                        storage,
+                        Arc::new(registry),
+                        Arc::new(SystemClock),
+                        Arc::new(UuidGenerator),
+                        ContextManager::new(paths.clone()),
+                    )
+                } else {
+                    let key = std::env::var("THAIS_COHERE_API_KEY")
+                        .or_else(|_| std::env::var("COHERE_API_KEY"))
+                        .context(
+                            "set THAIS_COHERE_API_KEY or COHERE_API_KEY for `--provider cohere`",
+                        )?;
+                    let model = model.unwrap_or_else(|| COHERE_DEFAULT_MODEL.to_owned());
+                    let provider: Arc<dyn Provider> =
+                        Arc::new(OpenAiCompatibleProvider::cohere(key, model)?);
+                    Runtime::new(
+                        storage,
+                        provider,
+                        Arc::new(SystemClock),
+                        Arc::new(UuidGenerator),
+                        ContextManager::new(paths.clone()),
+                    )
+                }
+            }
+            other => {
+                let id = other.preset_id().context("provider preset not found")?;
+                let registry =
+                    ProviderRegistry::preset(&paths, id, model, serde_json::Value::Null)?;
+                Runtime::with_registry(
+                    storage,
+                    Arc::new(registry),
+                    Arc::new(SystemClock),
+                    Arc::new(UuidGenerator),
+                    ContextManager::new(paths.clone()),
+                )
+            }
+        }
+    };
+
+    Ok(Arc::new(
+        runtime
+            .with_snapshot_base(paths.snapshots_dir())
+            .with_checkpoint_base(paths.sessions_dir())
+            .with_verifier(Verifier::load(&paths.config_file("verifier.toml"))?),
     ))
 }
 
@@ -272,12 +426,12 @@ async fn run(
         None => std::env::current_dir().context("could not determine the current directory")?,
     };
     let task = task.unwrap_or_else(|| "Say hello from the fake provider.".to_owned());
-    let runtime = build_runtime(fake, provider, model)?;
+    let runtime = build_runtime(fake, provider, model.clone())?;
     let (session, turn_id, events) = runtime
         .run_once_mode(
             workspace.to_string_lossy().into_owned(),
             task,
-            None,
+            model,
             mode.into(),
         )
         .await?;
@@ -472,6 +626,22 @@ fn print_human(events: &[EventEnvelope]) {
                 let _ = writeln!(stderr, "verification unavailable: {reason}");
             }
             EventKind::SessionCreated | EventKind::TurnStarted => {}
+            EventKind::ModelChanged => {
+                let model = event
+                    .payload
+                    .get("model")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown");
+                let _ = writeln!(stderr, "model changed: {model}");
+            }
+            EventKind::BudgetWarning => {
+                let budget = event
+                    .payload
+                    .get("budget")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("budget");
+                let _ = writeln!(stderr, "{budget} budget warning");
+            }
         }
     }
 }

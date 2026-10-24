@@ -10,6 +10,10 @@ use crate::error::ProtocolError;
 pub enum EventKind {
     /// A session was created.
     SessionCreated,
+    /// The model policy changed.
+    ModelChanged,
+    /// A budget threshold was crossed.
+    BudgetWarning,
     /// A pre-action snapshot was created.
     SnapshotCreated,
     /// A rollback restored a snapshot.
@@ -54,6 +58,8 @@ impl EventKind {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::SessionCreated => "session_created",
+            Self::ModelChanged => "model_changed",
+            Self::BudgetWarning => "budget_warning",
             Self::SnapshotCreated => "snapshot_created",
             Self::RollbackCompleted => "rollback_completed",
             Self::VerificationStarted => "verification_started",
@@ -79,6 +85,8 @@ impl EventKind {
     pub fn parse(value: &str) -> Result<Self, ProtocolError> {
         match value {
             "session_created" => Ok(Self::SessionCreated),
+            "model_changed" => Ok(Self::ModelChanged),
+            "budget_warning" => Ok(Self::BudgetWarning),
             "snapshot_created" => Ok(Self::SnapshotCreated),
             "rollback_completed" => Ok(Self::RollbackCompleted),
             "verification_started" => Ok(Self::VerificationStarted),

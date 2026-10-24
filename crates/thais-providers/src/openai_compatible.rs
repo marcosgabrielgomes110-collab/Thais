@@ -26,6 +26,7 @@ pub struct OpenAiCompatibleProvider {
     api_key: String,
     model: String,
     client: Client,
+    default_extra: Value,
     max_retries: u32,
     first_token_timeout: Duration,
     idle_timeout: Duration,
@@ -51,6 +52,7 @@ impl OpenAiCompatibleProvider {
             api_key: api_key.into(),
             model: model.into(),
             client,
+            default_extra: Value::Null,
             max_retries: 2,
             first_token_timeout: Duration::from_secs(60),
             idle_timeout: Duration::from_secs(60),
@@ -64,6 +66,13 @@ impl OpenAiCompatibleProvider {
         model: impl Into<String>,
     ) -> Result<Self, ProviderError> {
         Self::new("cohere", COHERE_BASE_URL, api_key, model)
+    }
+
+    /// Set provider-level default `extra` parameters.
+    #[must_use]
+    pub fn with_default_extra(mut self, extra: Value) -> Self {
+        self.default_extra = extra;
+        self
     }
 
     fn endpoint(&self) -> String {
@@ -108,10 +117,23 @@ impl OpenAiCompatibleProvider {
                     .collect(),
             );
         }
+        if let Some(extra) = self.default_extra.as_object() {
+            for (key, value) in extra {
+                body[key] = value.clone();
+            }
+        }
         if let Some(extra) = request.extra.as_object() {
             for (key, value) in extra {
                 body[key] = value.clone();
             }
+        }
+        let reasoning_model = model.starts_with("o1")
+            || model.starts_with("o3")
+            || model.starts_with("o4")
+            || model.contains("reasoner");
+        if reasoning_model && let Some(object) = body.as_object_mut() {
+            object.remove("temperature");
+            object.remove("top_p");
         }
         body
     }
@@ -521,6 +543,20 @@ mod tests {
                 ChatEvent::Done,
             ]
         );
+    }
+
+    #[test]
+    fn reasoning_models_do_not_receive_temperature() {
+        let provider =
+            OpenAiCompatibleProvider::new("openai", "https://api.openai.com/v1", "test-key", "o3")
+                .expect("provider");
+        let request = ChatRequest {
+            model: "o3".to_owned(),
+            temperature: Some(0.7),
+            ..ChatRequest::default()
+        };
+        let body = provider.build_body(&request);
+        assert!(body.get("temperature").is_none());
     }
 
     #[tokio::test]

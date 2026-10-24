@@ -1,0 +1,28 @@
+# Copy to ~/.config/thais/providers.toml.
+# This file never contains secrets. `auth` references an environment variable
+# or the keyring; omit it to use the normal credential lookup for the id.
+
+[[providers]]
+id = "openai"
+type = "openai"
+models = ["gpt-4.1"]
+auth = "env:THAIS_OPENAI_API_KEY"
+
+[[providers]]
+id = "anthropic"
+type = "anthropic"
+models = ["claude-sonnet-4-5"]
+auth = "keyring:anthropic:default"
+
+[[providers]]
+id = "deepseek"
+type = "openai-compatible"
+base_url = "https://api.deepseek.com/v1"
+models = ["deepseek-chat"]
+
+# Local providers need no key.
+[[providers]]
+id = "ollama"
+type = "openai-compatible"
+base_url = "http://localhost:11434/v1"
+models = ["llama3.2"]

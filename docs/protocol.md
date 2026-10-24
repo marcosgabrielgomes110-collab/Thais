@@ -1,6 +1,6 @@
 # Thais Agent API v1
 
-- Status: M0 protocol
+- Status: M3 protocol
 - Version: `1.0`
 - Transport: JSON-RPC 2.0 over stdio; one JSON message per line (NDJSON)
 - Boundary: all clients use this protocol through `thais-sdk`; no client imports core internals
@@ -42,14 +42,30 @@ the result so the client can decide how to proceed.
 | Method | Params | Result |
 |---|---|---|
 | `initialize` | `client_name`, `client_version`, `protocol_version`, `capabilities` | `server_name`, `server_version`, `protocol_version`, `capabilities` |
-| `session.create` | `workspace`, `mode` (`plan`/`build`), `model` optional | `session` |
-| `session.send` | `session_id`, `input`, `turn_id` optional | `turn_id` |
+| `session.create` | `workspace`, `name` optional, `mode` (`plan`/`build`), `model` optional, `steal_lease` optional | `session` |
+| `session.send` | `session_id`, `input`, `turn_id` optional, `model` optional | `turn_id` |
 | `session.cancel` | `session_id`, `turn_id` optional | `cancelled` |
 | `session.approve` | `session_id`, `approval_id`, `decision` (`allow`/`deny`) | `resolved` |
 | `session.subscribe` | `session_id`, `from_seq` optional | `subscription_id`, `from_seq` |
+| `session.list` | `include_archived` optional | `sessions` |
+| `session.get` | `session_id` | `session` |
+| `session.rename` | `session_id`, `name` | `session` |
+| `session.archive` | `session_id` | `session` |
+| `session.delete` | `session_id` | `deleted` (soft delete) |
+| `session.resume` | `session_id` | `session`, `checkpoint`, `pending_approvals` |
+| `session.set_model` | `session_id`, `role`, `model` | `session` |
+| `models.list` | none | `models` |
 
-`session_id` is present from day one even when only one session exists.
+A session object includes `session_id`, `name`, `workspace`, `mode`, `model`,
+`model_policy`, lifecycle `status`, timestamps, and cumulative
+`input_tokens`, `output_tokens`, and `cost_usd`. `session_id` is present from
+day one even when only one session exists.
 `session.create` uses the provider's first model when `model` is omitted.
+`session.create` and `session.send` accept an optional per-turn/session model.
+`session.set_model` changes the default (`role: "default"`) or one role.
+`session.delete` is a soft delete: the session disappears from lists but its
+Event Log is retained. `session.archive` keeps it visible when
+`include_archived` is true.
 
 ### Sequence semantics
 
@@ -62,7 +78,16 @@ the result so the client can decide how to proceed.
 - `session.cancel` cancels the active turn, or a specific `turn_id`. The runtime
   emits `turn_cancelled` when it observes the cancellation.
 - `session.approve` resolves the pending approval. Unknown or already-resolved
-  approvals return `resolved: false`.
+  approvals return `resolved: false`. Pending approvals are stored in SQLite;
+  `session.resume` re-surfaces them after a restart. The original in-flight turn
+  is not replayed, so a pending approval is either resolved or explicitly
+  re-driven by the client.
+- `session.create` and `resume` acquire the workspace mutating lease in build
+  mode. The lease is one-per-workspace across processes, expires after five
+  minutes without renewal, and can be stolen only with `steal_lease: true`.
+  Plan sessions never take it.
+- Session checkpoints are written under the data directory at
+  `sessions/<session_id>/checkpoint.md` with a machine-readable block.
 
 ## Events
 
@@ -88,6 +113,8 @@ Event kinds in v1:
 | Kind | Payload |
 |---|---|
 | `session_created` | `session` |
+| `model_changed` | `role`, `model`, optional `reason` |
+| `budget_warning` | `turn_id`, `budget`, `used`, `limit` |
 | `snapshot_created` | `turn_id`, `commit` |
 | `rollback_completed` | `turn_id`, `paths` |
 | `verification_started` | `turn_id`, `commands` |
@@ -103,13 +130,14 @@ Event kinds in v1:
 | `permission_granted` | `turn_id`, `tool`, `summary` |
 | `permission_denied` | `turn_id`, `tool`, `reason` |
 | `permission_resolved` | `approval_id`, `decision` |
-| `turn_completed` | `turn_id`, `usage.input_tokens`, `usage.output_tokens` |
+| `turn_completed` | `turn_id`, `model`, `usage.input_tokens`, `usage.output_tokens`, `cost_usd` |
 | `turn_cancelled` | `turn_id` |
 | `error` | `turn_id`, `message` |
 
 M0 emits the session, turn, model, reasoning, approval, completion, cancellation,
 and error events. M1 adds read tools. M2 adds snapshots, rollback, verification,
-write/edit/patch, bash, and git read tools.
+write/edit/patch, bash, and git read tools. M3 adds session lifecycle, model
+policy changes, budget warnings, and durable pending approvals.
 
 ## Errors
 
@@ -140,6 +168,21 @@ Responses carry exactly one of `result` or `error`.
 - `tool_result` includes the unified `diff` for mutations, so clients can show
   the change before and after approval.
 - `git_status` and `git_diff` are read-only tools.
+
+## M3 sessions and models
+
+- `providers.toml` lives in the user config directory and contains only
+  non-secret fields (`id`, `type`, `base_url`, `auth`, `models`, `extra`).
+  Secrets are resolved from the environment, keyring, or the `0600` fallback.
+- `models.toml` overrides catalog capabilities, context windows, aliases, and
+  cost per million tokens. `models.list` returns the merged catalog.
+- Model roles are `default`, `plan`, `build`, `explore`, `general`, and
+  `compact`. Ordered fallback is visible as `model_changed` with
+  `reason: "fallback"`.
+- The main loop rejects models that do not support tool calling.
+- Usage and cost are recorded on `turn_completed`; the TUI status bar shows the
+  most recent input/output tokens and USD cost. A per-turn cost budget emits
+  `budget_warning` at 80% and stops at 100%.
 
 ## Security and trust
 
