@@ -581,6 +581,17 @@ impl Storage {
         let payload_json = serde_json::to_string(&payload)?;
 
         let transaction = self.conn.transaction()?;
+        if let Some(existing) = transaction
+            .query_row(
+                "SELECT event_id, session_id, seq, timestamp, kind, payload_json
+                 FROM events WHERE event_id = ?1",
+                params![event_id],
+                EventRow::from_row,
+            )
+            .optional()?
+        {
+            return existing.into_event();
+        }
         let exists: i64 = transaction.query_row(
             "SELECT COUNT(*) FROM sessions WHERE session_id = ?1",
             params![session_id],

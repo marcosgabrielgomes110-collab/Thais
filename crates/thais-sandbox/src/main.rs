@@ -69,6 +69,7 @@ mod linux {
             RulesetStatus::FullyEnforced | RulesetStatus::PartiallyEnforced => {}
             RulesetStatus::NotEnforced => bail!("Landlock is not enforced by this kernel"),
         }
+        apply_seccomp()?;
 
         let error = Command::new("/bin/sh")
             .arg("-c")
@@ -76,5 +77,39 @@ mod linux {
             .current_dir(cwd)
             .exec();
         Err(anyhow::anyhow!("could not exec shell: {error}"))
+    }
+
+    fn apply_seccomp() -> anyhow::Result<()> {
+        use seccompiler::{SeccompAction, SeccompFilter};
+        use std::convert::TryInto;
+        let denied = [
+            libc::SYS_mount,
+            libc::SYS_umount2,
+            libc::SYS_ptrace,
+            libc::SYS_bpf,
+            libc::SYS_keyctl,
+            libc::SYS_reboot,
+            libc::SYS_kexec_load,
+            libc::SYS_init_module,
+            libc::SYS_finit_module,
+            libc::SYS_delete_module,
+            libc::SYS_syslog,
+            libc::SYS_acct,
+            libc::SYS_swapon,
+            libc::SYS_swapoff,
+        ];
+        let rules = denied
+            .into_iter()
+            .map(|syscall| (syscall, vec![]))
+            .collect();
+        let filter: seccompiler::BpfProgram = SeccompFilter::new(
+            rules,
+            SeccompAction::Allow,
+            SeccompAction::Errno(libc::EPERM as u32),
+            std::env::consts::ARCH.try_into()?,
+        )?
+        .try_into()?;
+        seccompiler::apply_filter(&filter)?;
+        Ok(())
     }
 }

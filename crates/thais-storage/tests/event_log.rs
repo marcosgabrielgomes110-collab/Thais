@@ -246,3 +246,28 @@ async fn concurrent_appends_get_unique_sequences() {
     sequences.sort_unstable();
     assert_eq!(sequences, (1..=10).collect::<Vec<_>>());
 }
+
+#[test]
+fn appending_the_same_event_id_is_idempotent() {
+    let temp = tempfile::tempdir().expect("temp");
+    let mut storage = Storage::open(temp.path().join("thais.db")).expect("open");
+    let session = session(temp.path());
+    storage.create_session(&session).expect("session");
+    let event = NewEvent::new(
+        "evt_fixed",
+        &session.session_id,
+        "2026-10-23T00:00:00Z",
+        EventKind::TurnStarted,
+        serde_json::json!({"turn_id":"t1","input":"hello"}),
+    );
+    let first = storage.append_event(event.clone()).expect("first");
+    let second = storage.append_event(event).expect("second");
+    assert_eq!(first.seq, second.seq);
+    assert_eq!(
+        storage
+            .events_after(&session.session_id, 0)
+            .expect("events")
+            .len(),
+        1
+    );
+}

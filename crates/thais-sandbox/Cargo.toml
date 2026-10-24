@@ -5,11 +5,16 @@ edition.workspace = true
 rust-version.workspace = true
 publish = false
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [dependencies]
 anyhow.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4"
+seccompiler = "0.5"
+libc = "0.2"
 
 [lints]
 workspace = true

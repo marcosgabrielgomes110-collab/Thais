@@ -428,7 +428,7 @@ M3 can run in parallel with M2 after M1. The critical path is M0 → M1 → M2 �
 | M3 Sessions and models | Done | 4–6 weeks |
 | M4 Memory and continuity | Done | 3–5 weeks |
 | M5 Tool ecosystem | Done | 5–7 weeks |
-| M6 Hardening | In progress | 5–7 weeks |
+| M6 Hardening | Done (Linux) | 5–7 weeks |
 | M7 Productization | Planned | 6–9 weeks |
 | M8 Post-v1 | Planned | Continuous |
 
@@ -436,7 +436,7 @@ Estimates assume one developer with systems experience but new to Rust and this 
 
 ## Current focus
 
-**M6 is in progress.** M0 through M5 are done and tagged (`v0.6.0-m5`). The hardening baseline now includes best-effort process sandbox detection, tool-output redaction, and security tests. Alpha real-repository feedback remains the product gate; M6 must close the sandbox, PTY, crash-recovery, and performance gaps before v1.
+**M6 is done for Linux and tagged (`v0.7.0-m6`).** M0 through M5 are tagged (`v0.6.0-m5`). The Linux hardening path includes namespaces/Landlock/seccomp, tool-output redaction, prompt-injection tests, idempotent event append, symlink-safe credentials, lease recovery, and a bounded TUI transcript. Stable cross-platform work (Seatbelt, Job Objects, PTY/ConPTY, Windows tests, fuzzing/loom, performance) is tracked for the stable release.
 
 Alpha is the first daily-use release: M0 + M1 + M2 + a simple checkpoint. The next gate is a developer using Alpha on a real repository for a week without losing work.
 
@@ -702,7 +702,7 @@ servers must already be installed by the user.
 
 ### M6 — Hardening
 
-**Status:** In progress.
+**Status:** Done for Linux (`v0.7.0-m6`); stable cross-platform pending.
 
 **Goal:** Make the product safe and reliable across platforms before calling it v1.
 
@@ -731,13 +731,14 @@ servers must already be installed by the user.
 - Protocol fuzzing and concurrency tests pass.
 - Sandbox escape tests document residual risk.
 
-**Implementation notes:** The Linux preview has `bwrap` namespace sandboxing
-with a Landlock helper fallback (`thais-sandbox`) that restricts filesystem
-access and denies TCP, `THAIS_SANDBOX=auto|off|required`, tool-output redaction,
-expanded secret patterns, prompt-injection tests, lease-expiry recovery, and a
-bounded TUI transcript. Still missing for stable: seccomp syscall filtering,
-Seatbelt, Windows Job Objects, PTY/ConPTY, Windows tests, fuzzing/loom,
-environment-leak coverage, end-to-end crash recovery, and the performance pass.
+**Implementation notes:** The Linux milestone has `bwrap` namespace sandboxing
+with a Landlock + seccomp helper fallback (`thais-sandbox`) that restricts
+filesystem access, denies TCP, and blocks dangerous syscalls;
+`THAIS_SANDBOX=auto|off|required`; tool-output redaction; expanded secret
+patterns; prompt-injection tests; idempotent event append; symlink-safe private
+writes; lease recovery; and a bounded TUI transcript. Stable cross-platform
+work remains: Seatbelt, Job Objects, PTY/ConPTY, Windows tests, fuzzing/loom,
+environment-leak coverage, and the performance pass.
 
 **Out of scope:** Formal verification, multi-user authentication, cloud isolation.
 
@@ -930,6 +931,7 @@ There are no open v1 decisions. The next decision that needs a choice gets a new
 | 2026-10-24 | Implemented M4 memory and continuity: approved MEMORY.md writes, checkpoint tasks/summaries, context rebuild with fallback, and FTS history search |
 | 2026-10-24 | Implemented M5 tool ecosystem: LSP, MCP stdio/HTTP, child sessions and subagents, and gated Git log/show/commit |
 | 2026-10-24 | Started M6 hardening: sandbox detection/fallback, tool-output redaction, expanded secret patterns, and security tests |
+| 2026-10-24 | Closed M6 for Linux: Landlock + seccomp helper, sandbox tests, idempotent events, symlink-safe credentials, lease recovery, and security documentation |
 | 2026-10-23 | Implemented the M2 build loop: write/edit/apply_patch, bash, git read tools, shadow-Git snapshots, rollback, verifier, plan approval, diff previews, personality file, and audit events |
 | 2026-10-23 | M1 accepted by CI; M2 implementation started |
 | 2026-10-23 | M2 accepted by CI on Linux/macOS, Windows check, and audit; tagged `v0.3.0-m2`; M1 tagged `v0.2.0-m1` |

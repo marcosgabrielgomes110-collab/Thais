@@ -273,19 +273,19 @@ thais lease release --workspace .
 | M4 — Memory and continuity | Done | `v0.5.0-m4` |
 | M5 — Tool ecosystem | Done | `v0.6.0-m5` |
 | Alpha | Feedback gate | em uso real |
-| M6 — Hardening | Linux preview | sandbox Linux, PTY/cross-platform no stable |
+| M6 — Hardening | Done no Linux | cross-platform no stable |
 
 O Alpha continua sendo o gate de feedback em repositório real. O **M6** está
 em andamento: a primeira camada já está no `main`, mas o marco ainda não foi
 fechado.
 
-### M6 hardening — Linux preview
+### M6 hardening — Linux
 
 Já implementado:
 
 - Sandbox Linux:
   - `bwrap` com namespaces quando disponível;
-  - fallback Landlock via `thais-sandbox`, com filesystem restrito e rede bloqueada;
+  - fallback Landlock + seccomp via `thais-sandbox`, com filesystem restrito, rede bloqueada e syscalls perigosas negadas;
   - `THAIS_SANDBOX=auto|off|required`;
   - fallback seguro mantendo `bash` em `ask`;
   - status do backend no `thais doctor`.
@@ -295,13 +295,12 @@ Já implementado:
 - Testes de prompt injection, redaction e recuperação de lease expirado.
 - TUI limita o transcript renderizado para evitar crescimento sem limite.
 
-Ainda falta para o stable cross-platform:
+O Linux está fechado para o M6. O stable cross-platform ainda precisa de:
 
 - Seatbelt nativo no macOS e Job Objects no Windows.
 - PTY/ConPTY nativo.
 - Matriz de testes Windows, fuzzing de protocolo e testes com `loom`.
 - Cobertura completa de environment leakage.
-- Retries idempotentes de mutações e recuperação de crash fim a fim.
 - Pass de performance de contexto, SQLite, eventos e TUI.
 
 ## Documentação

@@ -267,6 +267,17 @@ pub fn write_private(path: &Path, contents: &[u8]) -> Result<(), PathError> {
         )
     })?;
     create_private_dir(parent)?;
+    if let Ok(metadata) = std::fs::symlink_metadata(path)
+        && metadata.file_type().is_symlink()
+    {
+        return Err(PathError::io(
+            path,
+            std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "refusing to write through a symlink",
+            ),
+        ));
+    }
 
     let file_name = path
         .file_name()
@@ -447,5 +458,21 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod symlink_tests {
+    use super::*;
+
+    #[test]
+    fn write_private_refuses_a_symlink_destination() {
+        let root = tempfile::tempdir().expect("temp");
+        let target = root.path().join("target");
+        std::fs::write(&target, "safe").expect("target");
+        let link = root.path().join("credentials.toml");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        assert!(write_private(&link, b"secret").is_err());
+        assert_eq!(std::fs::read_to_string(target).expect("target"), "safe");
     }
 }
