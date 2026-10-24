@@ -48,6 +48,17 @@ impl NewEvent {
     }
 }
 
+/// One FTS match with its session label.
+#[derive(Debug, Clone)]
+pub struct HistoryHit {
+    /// Matching event.
+    pub event: EventEnvelope,
+    /// Session name.
+    pub session_name: String,
+    /// Canonical workspace.
+    pub workspace: String,
+}
+
 /// A mutating workspace lease.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceLease {
@@ -648,6 +659,49 @@ impl Storage {
         rows.into_iter().map(EventRow::into_event).collect()
     }
 
+    /// Search with optional session and workspace filters.
+    pub fn search_filtered(
+        &self,
+        query: &str,
+        session_id: Option<&str>,
+        workspace: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<HistoryHit>, StorageError> {
+        if query.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let limit = i64::from(limit.clamp(1, 200));
+        let mut statement = self.conn.prepare(
+            "SELECT e.event_id, e.session_id, e.seq, e.timestamp, e.kind, e.payload_json,
+                    s.name, s.canonical_workspace
+             FROM events e
+             JOIN sessions s ON s.session_id = e.session_id
+             WHERE e.event_id IN (
+                 SELECT event_id FROM events_fts WHERE events_fts MATCH ?1
+             )
+             AND (?2 IS NULL OR e.session_id = ?2)
+             AND (?3 IS NULL OR s.canonical_workspace = ?3 OR s.workspace = ?3)
+             ORDER BY e.seq ASC LIMIT ?4",
+        )?;
+        let rows = statement.query_map(params![query, session_id, workspace, limit], |row| {
+            Ok((
+                EventRow::from_row(row)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+            ))
+        })?;
+        let rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.into_iter()
+            .map(|(event, session_name, workspace)| {
+                Ok(HistoryHit {
+                    event: event.into_event()?,
+                    session_name,
+                    workspace,
+                })
+            })
+            .collect()
+    }
+
     /// Rebuild the derived FTS5 index from the append-only table.
     pub fn rebuild_fts(&self) -> Result<(), StorageError> {
         self.conn.execute_batch(
@@ -987,6 +1041,20 @@ impl StorageHandle {
     ) -> Result<Vec<EventEnvelope>, StorageError> {
         self.with(move |storage| storage.search(&query, limit))
             .await
+    }
+
+    /// Search with optional filters.
+    pub async fn search_filtered(
+        &self,
+        query: String,
+        session_id: Option<String>,
+        workspace: Option<String>,
+        limit: u32,
+    ) -> Result<Vec<HistoryHit>, StorageError> {
+        self.with(move |storage| {
+            storage.search_filtered(&query, session_id.as_deref(), workspace.as_deref(), limit)
+        })
+        .await
     }
 
     /// Rebuild the FTS5 index.

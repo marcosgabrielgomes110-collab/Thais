@@ -95,6 +95,23 @@ enum Command {
     },
     /// List models from providers.toml/models.toml.
     Models,
+    /// Search the Event Log with FTS5.
+    History {
+        /// FTS5 query.
+        query: String,
+        /// Limit to one session.
+        #[arg(long)]
+        session: Option<String>,
+        /// Limit to one workspace.
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// Maximum number of matches.
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+        /// Emit one JSON object per match.
+        #[arg(long)]
+        json: bool,
+    },
     /// Validate paths, permissions, credentials, and SQLite FTS5.
     Doctor,
     /// Manage provider credentials.
@@ -252,10 +269,65 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Sessions { all } => sessions(all).await,
         Command::Models => models().await,
+        Command::History {
+            query,
+            session,
+            workspace,
+            limit,
+            json,
+        } => history(query, session, workspace, limit, json).await,
         Command::Doctor => doctor(),
         Command::Auth { command } => auth(command),
         Command::Trust { status, remove } => trust(status, remove),
     }
+}
+
+async fn history(
+    query: String,
+    session: Option<String>,
+    workspace: Option<PathBuf>,
+    limit: u32,
+    json: bool,
+) -> anyhow::Result<()> {
+    let paths = Paths::discover()?;
+    paths.ensure()?;
+    let storage = StorageHandle::open(paths.database_path())?;
+    let workspace = workspace
+        .map(|workspace| thais_storage::canonical_workspace(&workspace))
+        .transpose()?
+        .and_then(|workspace| workspace.to_str().map(ToOwned::to_owned));
+    let hits = storage
+        .search_filtered(query, session, workspace, limit.clamp(1, 200))
+        .await?;
+    if hits.is_empty() {
+        println!("no matches");
+        return Ok(());
+    }
+    for hit in hits {
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string(&serde_json::json!({
+                    "session_id": hit.event.session_id,
+                    "session_name": hit.session_name,
+                    "workspace": hit.workspace,
+                    "seq": hit.event.seq,
+                    "kind": hit.event.kind.as_str(),
+                    "payload": hit.event.payload
+                }))?
+            );
+        } else {
+            println!(
+                "{}\t{}\t{}\t{}\t{}",
+                hit.session_name,
+                hit.event.session_id,
+                hit.event.seq,
+                hit.event.kind.as_str(),
+                hit.event.payload
+            );
+        }
+    }
+    Ok(())
 }
 
 async fn sessions(all: bool) -> anyhow::Result<()> {
@@ -641,6 +713,20 @@ fn print_human(events: &[EventEnvelope]) {
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("budget");
                 let _ = writeln!(stderr, "{budget} budget warning");
+            }
+            EventKind::ContextRebuilt => {
+                let _ = writeln!(stderr, "context rebuilt");
+            }
+            EventKind::ContextRebuildFailed => {
+                let _ = writeln!(stderr, "context rebuild failed; using checkpoint");
+            }
+            EventKind::MemoryUpdated => {
+                let rule = event
+                    .payload
+                    .get("rule")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("rule");
+                let _ = writeln!(stderr, "memory updated: {rule}");
             }
         }
     }

@@ -14,6 +14,12 @@ pub enum EventKind {
     ModelChanged,
     /// A budget threshold was crossed.
     BudgetWarning,
+    /// Context was rebuilt from a checkpoint and compacted history.
+    ContextRebuilt,
+    /// Context rebuild failed and the runtime fell back.
+    ContextRebuildFailed,
+    /// An approved memory rule was written.
+    MemoryUpdated,
     /// A pre-action snapshot was created.
     SnapshotCreated,
     /// A rollback restored a snapshot.
@@ -60,6 +66,9 @@ impl EventKind {
             Self::SessionCreated => "session_created",
             Self::ModelChanged => "model_changed",
             Self::BudgetWarning => "budget_warning",
+            Self::ContextRebuilt => "context_rebuilt",
+            Self::ContextRebuildFailed => "context_rebuild_failed",
+            Self::MemoryUpdated => "memory_updated",
             Self::SnapshotCreated => "snapshot_created",
             Self::RollbackCompleted => "rollback_completed",
             Self::VerificationStarted => "verification_started",
@@ -87,6 +96,9 @@ impl EventKind {
             "session_created" => Ok(Self::SessionCreated),
             "model_changed" => Ok(Self::ModelChanged),
             "budget_warning" => Ok(Self::BudgetWarning),
+            "context_rebuilt" => Ok(Self::ContextRebuilt),
+            "context_rebuild_failed" => Ok(Self::ContextRebuildFailed),
+            "memory_updated" => Ok(Self::MemoryUpdated),
             "snapshot_created" => Ok(Self::SnapshotCreated),
             "rollback_completed" => Ok(Self::RollbackCompleted),
             "verification_started" => Ok(Self::VerificationStarted),

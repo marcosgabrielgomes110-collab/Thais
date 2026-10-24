@@ -1,7 +1,7 @@
 //! Session runtime: create sessions, run turns, stream events, and resolve
 //! approvals and cancellations.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,14 +15,14 @@ use thais_protocol::event::{EventEnvelope, EventKind};
 use thais_protocol::jsonrpc::{Id, Request, Response};
 use thais_protocol::method;
 use thais_protocol::session::{
-    ApprovalDecision, InitializeParams, InitializeResult, ModelInfo, ModelsListResult,
-    SessionApproveParams, SessionApproveResult, SessionArchiveParams, SessionArchiveResult,
-    SessionCancelParams, SessionCancelResult, SessionCreateParams, SessionCreateResult,
-    SessionDeleteParams, SessionDeleteResult, SessionGetParams, SessionGetResult, SessionInfo,
-    SessionListParams, SessionListResult, SessionMode, SessionRenameParams, SessionRenameResult,
-    SessionResumeParams, SessionResumeResult, SessionSendParams, SessionSendResult,
-    SessionSetModelParams, SessionSetModelResult, SessionStatus, SessionSubscribeParams,
-    SessionSubscribeResult,
+    ApprovalDecision, HistoryMatch, HistorySearchParams, HistorySearchResult, InitializeParams,
+    InitializeResult, ModelInfo, ModelsListResult, SessionApproveParams, SessionApproveResult,
+    SessionArchiveParams, SessionArchiveResult, SessionCancelParams, SessionCancelResult,
+    SessionCreateParams, SessionCreateResult, SessionDeleteParams, SessionDeleteResult,
+    SessionGetParams, SessionGetResult, SessionInfo, SessionListParams, SessionListResult,
+    SessionMode, SessionRenameParams, SessionRenameResult, SessionResumeParams,
+    SessionResumeResult, SessionSendParams, SessionSendResult, SessionSetModelParams,
+    SessionSetModelResult, SessionStatus, SessionSubscribeParams, SessionSubscribeResult,
 };
 use thais_providers::{
     ChatEvent, ChatMessage, ChatRequest, Provider, ToolCall, ToolDefinition, Usage,
@@ -51,6 +51,8 @@ const MAX_TURN_TIME: Duration = Duration::from_secs(180);
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(60);
 const LEASE_TTL_SECS: u64 = 300;
 const DEFAULT_MAX_TURN_COST_USD: f64 = 2.0;
+const DEFAULT_REBUILD_THRESHOLD_TOKENS: usize = 12_000;
+const DEFAULT_HISTORY_TAIL_TURNS: usize = 4;
 
 fn model_info(model: CatalogModel) -> ModelInfo {
     ModelInfo {
@@ -185,6 +187,8 @@ pub struct Runtime {
     snapshot_base: Option<PathBuf>,
     checkpoint_base: Option<PathBuf>,
     max_turn_cost_usd: f64,
+    rebuild_threshold_tokens: usize,
+    history_tail_turns: usize,
     verifier: Option<Arc<Verifier>>,
     sessions: Mutex<HashMap<String, SessionState>>,
     approvals: Mutex<HashMap<String, oneshot::Sender<ApprovalDecision>>>,
@@ -211,6 +215,8 @@ impl Runtime {
             snapshot_base: None,
             checkpoint_base: None,
             max_turn_cost_usd: DEFAULT_MAX_TURN_COST_USD,
+            rebuild_threshold_tokens: DEFAULT_REBUILD_THRESHOLD_TOKENS,
+            history_tail_turns: DEFAULT_HISTORY_TAIL_TURNS,
             verifier: None,
             sessions: Mutex::new(HashMap::new()),
             approvals: Mutex::new(HashMap::new()),
@@ -237,6 +243,8 @@ impl Runtime {
             snapshot_base: None,
             checkpoint_base: None,
             max_turn_cost_usd: DEFAULT_MAX_TURN_COST_USD,
+            rebuild_threshold_tokens: DEFAULT_REBUILD_THRESHOLD_TOKENS,
+            history_tail_turns: DEFAULT_HISTORY_TAIL_TURNS,
             verifier: None,
             sessions: Mutex::new(HashMap::new()),
             approvals: Mutex::new(HashMap::new()),
@@ -269,6 +277,20 @@ impl Runtime {
     #[must_use]
     pub fn with_cost_limit(mut self, limit: f64) -> Self {
         self.max_turn_cost_usd = limit.max(0.0);
+        self
+    }
+
+    /// Set the prompt token threshold that triggers a context rebuild.
+    #[must_use]
+    pub fn with_rebuild_threshold(mut self, tokens: usize) -> Self {
+        self.rebuild_threshold_tokens = tokens.max(1);
+        self
+    }
+
+    /// Set how many recent turns stay verbatim across a rebuild.
+    #[must_use]
+    pub fn with_history_tail_turns(mut self, turns: usize) -> Self {
+        self.history_tail_turns = turns.max(1);
         self
     }
 
@@ -378,6 +400,8 @@ impl Runtime {
                 state: "active".to_owned(),
                 plan: None,
                 tasks: Vec::new(),
+                summary: None,
+                last_compacted_seq: 0,
                 updated_at: self.clock.now_rfc3339(),
             },
         )?;
@@ -583,6 +607,47 @@ impl Runtime {
         Ok(session)
     }
 
+    /// Search the append-only Event Log with optional session/workspace filters.
+    pub async fn history_search(
+        &self,
+        params: HistorySearchParams,
+    ) -> Result<HistorySearchResult, RuntimeError> {
+        let workspace = match params.workspace {
+            Some(workspace) => {
+                let canonical =
+                    thais_storage::canonical_workspace(Path::new(&workspace)).map_err(|error| {
+                        RuntimeError::InvalidRequest(format!("invalid workspace: {error}"))
+                    })?;
+                Some(
+                    canonical
+                        .to_str()
+                        .ok_or(RuntimeError::InvalidWorkspace)?
+                        .to_owned(),
+                )
+            }
+            None => None,
+        };
+        let hits = self
+            .storage
+            .search_filtered(
+                params.query,
+                params.session_id,
+                workspace,
+                params.limit.unwrap_or(50),
+            )
+            .await?;
+        Ok(HistorySearchResult {
+            matches: hits
+                .into_iter()
+                .map(|hit| HistoryMatch {
+                    event: hit.event,
+                    session_name: hit.session_name,
+                    workspace: hit.workspace,
+                })
+                .collect(),
+        })
+    }
+
     /// List models exposed by the active provider.
     pub async fn list_models(&self) -> Result<Vec<ModelInfo>, RuntimeError> {
         let models = self.providers.models().await?;
@@ -651,10 +716,16 @@ impl Runtime {
         let previous = read_checkpoint(&path)?;
         let plan = plan.or_else(|| previous.as_ref().and_then(|state| state.plan.clone()));
         let tasks = if tasks.is_empty() {
-            previous.map_or_else(Vec::new, |state| state.tasks)
+            previous
+                .as_ref()
+                .map_or_else(Vec::new, |state| state.tasks.clone())
         } else {
             tasks
         };
+        let summary = previous.as_ref().and_then(|state| state.summary.clone());
+        let last_compacted_seq = previous
+            .as_ref()
+            .map_or(0, |state| state.last_compacted_seq);
         let checkpoint = CheckpointState {
             session_id: session.session_id,
             name: session.name,
@@ -664,6 +735,8 @@ impl Runtime {
             state: state.to_owned(),
             plan,
             tasks,
+            summary,
+            last_compacted_seq,
             updated_at: self.clock.now_rfc3339(),
         };
         write_checkpoint(&path, &checkpoint)?;
@@ -1209,6 +1282,21 @@ impl Runtime {
                     Err(error) => RequestOutcome::error(id, error.to_error_object()),
                 }
             }
+            method::HISTORY_SEARCH => {
+                let params: HistorySearchParams = match request.params_as() {
+                    Ok(params) => params,
+                    Err(error) => {
+                        return RequestOutcome::error(
+                            id,
+                            ProtocolError::InvalidParams(error.to_string()).to_error_object(),
+                        );
+                    }
+                };
+                match self.history_search(params).await {
+                    Ok(result) => RequestOutcome::ok(id, &result),
+                    Err(error) => RequestOutcome::error(id, error.to_error_object()),
+                }
+            }
             method::MODELS_LIST => match self.list_models().await {
                 Ok(models) => RequestOutcome::ok(id, &ModelsListResult { models }),
                 Err(error) => RequestOutcome::error(id, error.to_error_object()),
@@ -1283,6 +1371,170 @@ impl Runtime {
         }
     }
 
+    async fn build_prompt(
+        &self,
+        session: &SessionInfo,
+        input: &str,
+        turn_id: &str,
+    ) -> Result<crate::context::PromptBundle, RuntimeError> {
+        let path = self.checkpoint_path(&session.session_id);
+        let checkpoint = read_checkpoint(&path)?;
+        let last_seq = checkpoint
+            .as_ref()
+            .map_or(0, |checkpoint| checkpoint.last_compacted_seq);
+        let events = self
+            .storage
+            .events_after(session.session_id.clone(), last_seq)
+            .await?;
+        let session_context = format_session_context(checkpoint.as_ref());
+        let history = format_history(&events);
+        let bundle = self
+            .context
+            .build_with_history(
+                Path::new(&session.workspace),
+                input,
+                Some(&history),
+                Some(&session_context),
+            )
+            .await?;
+        if bundle.estimated_tokens <= self.rebuild_threshold_tokens || events.is_empty() {
+            return Ok(bundle);
+        }
+
+        // Write-ahead checkpoint before touching the prompt state.
+        self.persist_checkpoint(&session.session_id, "rebuilding", None, Vec::new())
+            .await?;
+        match self
+            .rebuild_prompt(session, input, turn_id, checkpoint.as_ref(), &events)
+            .await
+        {
+            Ok(bundle) => Ok(bundle),
+            Err(error) => {
+                let _ = self
+                    .append_event(
+                        &session.session_id,
+                        EventKind::ContextRebuildFailed,
+                        json!({"turn_id": turn_id, "message": error.to_string()}),
+                    )
+                    .await;
+                let fallback_events = tail_turns(&events, self.history_tail_turns);
+                let fallback_history = format_history(&fallback_events);
+                let session_context = format_session_context(checkpoint.as_ref());
+                let bundle = self
+                    .context
+                    .build_with_history(
+                        Path::new(&session.workspace),
+                        input,
+                        Some(&fallback_history),
+                        Some(&session_context),
+                    )
+                    .await?;
+                let _ = self
+                    .persist_checkpoint(&session.session_id, "active", None, Vec::new())
+                    .await;
+                Ok(bundle)
+            }
+        }
+    }
+
+    async fn rebuild_prompt(
+        &self,
+        session: &SessionInfo,
+        input: &str,
+        turn_id: &str,
+        checkpoint: Option<&CheckpointState>,
+        events: &[EventEnvelope],
+    ) -> Result<crate::context::PromptBundle, RuntimeError> {
+        let turns = split_turns(events);
+        if turns.len() < 2 {
+            return Err(RuntimeError::InvalidRequest(
+                "not enough turns to compact".to_owned(),
+            ));
+        }
+        let keep = self
+            .history_tail_turns
+            .min(turns.len().saturating_sub(1))
+            .max(1);
+        let split = turns.len() - keep;
+        let older = &turns[..split];
+        let kept_events = turns[split..]
+            .iter()
+            .flat_map(|turn| turn.iter().cloned())
+            .collect::<Vec<_>>();
+        let compacted = summarize_turns(older);
+        let summary = merge_summaries(
+            checkpoint.and_then(|checkpoint| checkpoint.summary.as_deref()),
+            &compacted,
+        );
+        let last_compacted_seq = older
+            .last()
+            .and_then(|turn| turn.last())
+            .map_or(0, |event| event.seq);
+        let plan = checkpoint.and_then(|checkpoint| checkpoint.plan.clone());
+        let tasks = checkpoint.map_or_else(Vec::new, |checkpoint| checkpoint.tasks.clone());
+        self.persist_checkpoint_compacted(
+            &session.session_id,
+            "active",
+            plan,
+            tasks,
+            summary.clone(),
+            last_compacted_seq,
+        )
+        .await?;
+        let new_checkpoint = read_checkpoint(&self.checkpoint_path(&session.session_id))?;
+        let session_context = format_session_context(new_checkpoint.as_ref());
+        let history = format_history(&kept_events);
+        let bundle = self
+            .context
+            .build_with_history(
+                Path::new(&session.workspace),
+                input,
+                Some(&history),
+                Some(&session_context),
+            )
+            .await?;
+        self.append_event(
+            &session.session_id,
+            EventKind::ContextRebuilt,
+            json!({
+                "turn_id": turn_id,
+                "older_turns": older.len(),
+                "kept_turns": keep,
+                "last_compacted_seq": last_compacted_seq,
+                "summary_chars": summary.as_deref().map_or(0, str::len)
+            }),
+        )
+        .await?;
+        Ok(bundle)
+    }
+
+    async fn persist_checkpoint_compacted(
+        &self,
+        session_id: &str,
+        state: &str,
+        plan: Option<String>,
+        tasks: Vec<String>,
+        summary: Option<String>,
+        last_compacted_seq: u64,
+    ) -> Result<(), RuntimeError> {
+        let session = self.storage.get_session(session_id.to_owned()).await?;
+        let checkpoint = CheckpointState {
+            session_id: session.session_id,
+            name: session.name,
+            workspace: session.workspace,
+            mode: session.mode,
+            model_policy: session.model_policy,
+            state: state.to_owned(),
+            plan,
+            tasks,
+            summary,
+            last_compacted_seq,
+            updated_at: self.clock.now_rfc3339(),
+        };
+        write_checkpoint(&self.checkpoint_path(session_id), &checkpoint)?;
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn run_turn_inner(
         &self,
@@ -1316,10 +1568,7 @@ impl Runtime {
                 "no provider for model {model}"
             )))
         })?;
-        let bundle = self
-            .context
-            .build(Path::new(&session.workspace), input)
-            .await?;
+        let bundle = self.build_prompt(&session, input, turn_id).await?;
         if let Some(info) = &pricing
             && bundle.estimated_tokens as u64 > info.context_window
         {
@@ -1547,7 +1796,8 @@ impl Runtime {
                 } else {
                     None
                 };
-                self.persist_checkpoint(session_id, "ready", plan, Vec::new())
+                let tasks = plan.as_deref().map_or_else(Vec::new, derive_tasks);
+                self.persist_checkpoint(session_id, "ready", plan, tasks)
                     .await?;
                 let cost_usd = pricing.as_ref().map_or(0.0, |pricing| {
                     (total_usage.input_tokens as f64 * pricing.input_cost_per_million
@@ -1746,6 +1996,24 @@ impl Runtime {
             }
 
             for (index, call, arguments) in mutating_calls {
+                if call.name == "memory_write" {
+                    let result = tools.execute(&call.name, arguments.clone());
+                    if let Ok(result) = &result {
+                        let rule = arguments.get("rule").and_then(Value::as_str).unwrap_or("");
+                        self.append_event(
+                            session_id,
+                            EventKind::MemoryUpdated,
+                            json!({
+                                "turn_id": turn_id,
+                                "rule": rule,
+                                "diff": result.diff
+                            }),
+                        )
+                        .await?;
+                    }
+                    executed.insert(index, result);
+                    continue;
+                }
                 let snapshot = match snapshots.create() {
                     Ok(snapshot) => {
                         self.append_event(
@@ -1933,6 +2201,249 @@ struct ToolAccumulator {
 enum PreparedTool {
     Execute { call: ToolCall, arguments: Value },
     Result { call: ToolCall, result: ToolResult },
+}
+
+fn derive_tasks(plan: &str) -> Vec<String> {
+    plan.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter_map(|line| {
+            let task = line
+                .strip_prefix("- [ ] ")
+                .or_else(|| line.strip_prefix("- [x] "))
+                .or_else(|| line.strip_prefix("- "))
+                .or_else(|| line.strip_prefix("* "))
+                .or_else(|| {
+                    let mut parts = line.splitn(2, '.');
+                    let number = parts.next()?;
+                    if number.chars().all(|character| character.is_ascii_digit())
+                        && let Some(rest) = parts.next()
+                    {
+                        Some(rest.trim())
+                    } else {
+                        None
+                    }
+                })?;
+            (!task.is_empty()).then(|| truncate_text(task, 200))
+        })
+        .take(20)
+        .collect()
+}
+
+fn split_turns(events: &[EventEnvelope]) -> Vec<Vec<EventEnvelope>> {
+    let mut turns = Vec::new();
+    let mut current: Option<Vec<EventEnvelope>> = None;
+    for event in events {
+        if event.kind == EventKind::TurnStarted {
+            if let Some(turn) = current.take()
+                && !turn.is_empty()
+            {
+                turns.push(turn);
+            }
+            current = Some(vec![event.clone()]);
+        } else if let Some(turn) = current.as_mut() {
+            turn.push(event.clone());
+        }
+    }
+    if let Some(turn) = current
+        && !turn.is_empty()
+    {
+        turns.push(turn);
+    }
+    turns
+}
+
+fn tail_turns(events: &[EventEnvelope], keep: usize) -> Vec<EventEnvelope> {
+    let turns = split_turns(events);
+    let start = turns.len().saturating_sub(keep.max(1));
+    turns[start..]
+        .iter()
+        .flat_map(|turn| turn.iter().cloned())
+        .collect()
+}
+
+fn format_history(events: &[EventEnvelope]) -> String {
+    let mut output = String::new();
+    for turn in split_turns(events) {
+        let mut assistant = String::new();
+        for event in turn {
+            match event.kind {
+                EventKind::TurnStarted => {
+                    flush_assistant(&mut assistant, &mut output);
+                    if let Some(input) = event.payload.get("input").and_then(Value::as_str) {
+                        output.push_str("\nUser: ");
+                        output.push_str(&truncate_output(input));
+                    }
+                }
+                EventKind::ModelDelta => {
+                    if let Some(text) = event.payload.get("text").and_then(Value::as_str) {
+                        assistant.push_str(text);
+                    }
+                }
+                EventKind::ToolCall => {
+                    flush_assistant(&mut assistant, &mut output);
+                    let name = event
+                        .payload
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("tool");
+                    let arguments = event
+                        .payload
+                        .get("arguments")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    output.push_str(&format!("\nTool: {name} {}", truncate_text(arguments, 400)));
+                }
+                EventKind::ToolResult => {
+                    flush_assistant(&mut assistant, &mut output);
+                    let name = event
+                        .payload
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("tool");
+                    let content = event
+                        .payload
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    output.push_str(&format!(
+                        "\nResult({name}): {}",
+                        truncate_text(content, 600)
+                    ));
+                }
+                EventKind::PermissionResolved => {
+                    flush_assistant(&mut assistant, &mut output);
+                    let decision = event
+                        .payload
+                        .get("decision")
+                        .and_then(Value::as_str)
+                        .unwrap_or("resolved");
+                    output.push_str(&format!("\nApproval: {decision}"));
+                }
+                EventKind::Error => {
+                    flush_assistant(&mut assistant, &mut output);
+                    let message = event
+                        .payload
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("error");
+                    output.push_str(&format!("\nError: {}", truncate_text(message, 400)));
+                }
+                _ => {}
+            }
+        }
+        flush_assistant(&mut assistant, &mut output);
+    }
+    output
+}
+
+fn flush_assistant(assistant: &mut String, output: &mut String) {
+    if !assistant.trim().is_empty() {
+        output.push_str("\nAssistant: ");
+        output.push_str(&truncate_text(assistant, 2_000));
+    }
+    assistant.clear();
+}
+
+fn format_session_context(checkpoint: Option<&CheckpointState>) -> String {
+    let Some(checkpoint) = checkpoint else {
+        return "(none)".to_owned();
+    };
+    let mut output = format!("State: {}\n", checkpoint.state);
+    if let Some(plan) = &checkpoint.plan {
+        output.push_str("Approved plan:\n");
+        output.push_str(&truncate_text(plan, 2_000));
+        output.push('\n');
+    }
+    if !checkpoint.tasks.is_empty() {
+        output.push_str("Tasks:\n");
+        for task in &checkpoint.tasks {
+            output.push_str("- [ ] ");
+            output.push_str(task);
+            output.push('\n');
+        }
+    }
+    if let Some(summary) = &checkpoint.summary {
+        output.push_str("Compacted history:\n");
+        output.push_str(summary);
+        output.push('\n');
+    }
+    output
+}
+
+fn summarize_turns(turns: &[Vec<EventEnvelope>]) -> String {
+    let mut requests = Vec::new();
+    let mut tools: BTreeMap<String, usize> = BTreeMap::new();
+    let mut decisions = Vec::new();
+    for turn in turns {
+        for event in turn {
+            match event.kind {
+                EventKind::TurnStarted => {
+                    if let Some(input) = event.payload.get("input").and_then(Value::as_str) {
+                        requests.push(truncate_text(input, 200));
+                    }
+                }
+                EventKind::ToolCall => {
+                    let name = event
+                        .payload
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("tool");
+                    *tools.entry(name.to_owned()).or_insert(0) += 1;
+                }
+                EventKind::PermissionResolved => {
+                    if let Some(decision) = event.payload.get("decision").and_then(Value::as_str) {
+                        decisions.push(decision.to_owned());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut output = format!("Compacted {} earlier turns.\n", turns.len());
+    if !requests.is_empty() {
+        output.push_str("Requests:\n");
+        for request in requests.iter().take(8) {
+            output.push_str("- ");
+            output.push_str(request);
+            output.push('\n');
+        }
+    }
+    if !tools.is_empty() {
+        output.push_str("Tools: ");
+        let rendered = tools
+            .iter()
+            .map(|(name, count)| format!("{name} x{count}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        output.push_str(&truncate_text(&rendered, 500));
+        output.push('\n');
+    }
+    if !decisions.is_empty() {
+        output.push_str(&format!("Approvals: {}\n", decisions.join(", ")));
+    }
+    truncate_text(&output, 4_000)
+}
+
+fn merge_summaries(previous: Option<&str>, new: &str) -> Option<String> {
+    let new = new.trim();
+    match (
+        previous.map(str::trim).filter(|value| !value.is_empty()),
+        new.is_empty(),
+    ) {
+        (Some(previous), false) => Some(truncate_text(&format!("{previous}\n\n{new}"), 4_000)),
+        (Some(previous), true) => Some(previous.to_owned()),
+        (None, false) => Some(new.to_owned()),
+        (None, true) => None,
+    }
+}
+
+fn truncate_text(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        text.to_owned()
+    } else {
+        format!("{}…", text.chars().take(max_chars).collect::<String>())
+    }
 }
 
 fn truncate_output(text: &str) -> String {

@@ -12,6 +12,7 @@ use serde_json::{Value, json};
 use crate::bash::BashTool;
 use crate::error::ToolError;
 use crate::git::{GitDiffTool, GitStatusTool};
+use crate::memory::MemoryWriteTool;
 use crate::mutating::{ApplyPatchTool, EditTool, WriteTool};
 use crate::path_jail::PathJail;
 
@@ -123,6 +124,9 @@ impl ToolRegistry {
             .tools
             .insert("apply_patch".to_owned(), Arc::new(ApplyPatchTool));
         registry.tools.insert("bash".to_owned(), Arc::new(BashTool));
+        registry
+            .tools
+            .insert("memory_write".to_owned(), Arc::new(MemoryWriteTool));
         Ok(registry)
     }
 

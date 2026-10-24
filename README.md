@@ -288,6 +288,7 @@ The workspace is a Rust workspace with a single `thais` binary and a
 | `make run ARGS="doctor"` | Validate paths, permissions, keyring, and FTS5 |
 | `make run ARGS="sessions --all"` | List persisted sessions, including archived ones |
 | `make run ARGS="models"` | List the provider/model catalog from user config |
+| `make run ARGS="history \"decision\""` | Search the Event Log with FTS5 |
 | `make tools` | Install `cargo-nextest`, `cargo-audit`, and `cargo-deny` |
 | `make install PREFIX=...` | Install the binary; `make uninstall` removes only the binary |
 
@@ -378,6 +379,26 @@ rejects models without tool calling. `turn_completed` carries input/output
 tokens, USD cost, and cumulative session totals; the TUI status bar and
 `session.get`/`session.list` expose them. The
 per-turn cost budget defaults to USD 2, warns at 80%, and stops at 100%.
+
+### M4 memory and continuity
+
+- `MEMORY.md` at the project root stores approved project rules. The model
+  proposes writes through the `memory_write` tool; the gate asks, shows the
+  diff, and records the decision. Writes are atomic, capped at 2,000 estimated
+  tokens, reject likely secrets, and detect duplicates.
+- `MEMORY.md` sits below project and global `AGENTS.md` in the prompt and never
+  overrides safety rules.
+- Each turn writes a checkpoint with state, approved plan, derived tasks, and
+  the compacted summary. Before a rebuild, a write-ahead checkpoint is written
+  first.
+- At the configured token threshold, the runtime summarizes older turns,
+  preserves the most recent four turns verbatim, keeps safety/AGENTS/badge/
+  memory in the prompt, and emits `context_rebuilt`. A failed rebuild falls
+  back to the checkpoint plus `MEMORY.md` and emits `context_rebuild_failed`.
+- `history.search` searches `events_fts` with optional session and workspace
+  filters. The index is rebuildable from the append-only Event Log.
+- Session resume uses the checkpoint summary plus the event tail after
+  `last_compacted_seq`.
 
 ## Out of scope
 

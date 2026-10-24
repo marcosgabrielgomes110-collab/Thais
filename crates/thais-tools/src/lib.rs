@@ -5,6 +5,7 @@
 pub mod bash;
 pub mod error;
 pub mod git;
+pub mod memory;
 pub mod mutating;
 pub mod path_jail;
 pub mod permission;

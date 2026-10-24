@@ -426,7 +426,7 @@ M3 can run in parallel with M2 after M1. The critical path is M0 → M1 → M2 �
 | M2 Safe build | Done | 5–7 weeks |
 | Alpha: M0 + M1 + M2 + simple checkpoint | Planned | 12–18 weeks cumulative |
 | M3 Sessions and models | Done | 4–6 weeks |
-| M4 Memory and continuity | Planned | 3–5 weeks |
+| M4 Memory and continuity | Done | 3–5 weeks |
 | M5 Tool ecosystem | Planned | 5–7 weeks |
 | M6 Hardening | Planned | 5–7 weeks |
 | M7 Productization | Planned | 6–9 weeks |
@@ -436,7 +436,7 @@ Estimates assume one developer with systems experience but new to Rust and this 
 
 ## Current focus
 
-**M3 is done and tagged (`v0.4.0-m3`).** M0, M1, and M2 are done and tagged (`v0.2.0-m1`, `v0.3.0-m2`). Alpha adds the simple checkpoint and manual resume; the M3 checkpoint already covers the basic persistence path, so Alpha is now the next product gate. The critical path is Alpha feedback before M4.
+**M4 is done and tagged (`v0.5.0-m4`).** M0, M1, M2, and M3 are done and tagged (`v0.2.0-m1`, `v0.3.0-m2`, `v0.4.0-m3`). The checkpoint, resume, memory, and rebuild path are implemented. Alpha real-repository feedback remains the product gate; the next numbered milestone is M5.
 
 Alpha is the first daily-use release: M0 + M1 + M2 + a simple checkpoint. The next gate is a developer using Alpha on a real repository for a week without losing work.
 
@@ -623,6 +623,8 @@ launch-validated. The default per-turn cost limit is USD 2.
 
 ### M4 — Memory and continuity
 
+**Status:** Done (`v0.5.0-m4`).
+
 **Goal:** Keep long sessions coherent without losing the task at the context limit.
 
 **Depends on:** Alpha and M3.
@@ -639,6 +641,15 @@ launch-validated. The default per-turn cost limit is USD 2.
 - Session resume from checkpoint plus the event log tail.
 - SQLite FTS5 history search over the `events` table in `thais.db`, using the derived `events_fts` index, with session and workspace filters; `history.search`.
 - Rebuild failure fallback using checkpoint plus `MEMORY.md`.
+
+**Implementation notes:** M4 ships `memory_write` with gate approval and diff,
+`MEMORY.md` precedence below `AGENTS.md`, a 2,000-token cap and duplicate/secret
+checks; checkpoint task derivation and compacted summaries; threshold-based
+context rebuild with four recent turns preserved and write-ahead checkpoints;
+`history.search` over `events_fts` with session/workspace filters; and rebuild
+fallback. Task completion marking is deliberately conservative: tasks are
+derived from the approved plan and persisted, but the runtime does not guess
+completion from tool output.
 
 **Acceptance criteria:**
 
@@ -896,6 +907,7 @@ There are no open v1 decisions. The next decision that needs a choice gets a new
 | 2026-10-23 | M0 accepted by CI on Linux/macOS, Windows check, and audit; tagged `v0.1.0-m0` |
 | 2026-10-23 | Implemented the M1 read-only loop: Cohere/OpenAI-compatible provider, context manager, environment badge, AGENTS.md, read tools, gate, parallel tool execution, TUI, and budgets |
 | 2026-10-23 | Implemented M3 sessions and models: lifecycle, checkpoints, workspace leases, provider registry, model catalog/roles, Anthropic adapter, cost budgets, TUI switcher, and CLI commands |
+| 2026-10-24 | Implemented M4 memory and continuity: approved MEMORY.md writes, checkpoint tasks/summaries, context rebuild with fallback, and FTS history search |
 | 2026-10-23 | Implemented the M2 build loop: write/edit/apply_patch, bash, git read tools, shadow-Git snapshots, rollback, verifier, plan approval, diff previews, personality file, and audit events |
 | 2026-10-23 | M1 accepted by CI; M2 implementation started |
 | 2026-10-23 | M2 accepted by CI on Linux/macOS, Windows check, and audit; tagged `v0.3.0-m2`; M1 tagged `v0.2.0-m1` |

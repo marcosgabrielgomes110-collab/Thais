@@ -1,6 +1,6 @@
 # Thais Agent API v1
 
-- Status: M3 protocol
+- Status: M4 protocol
 - Version: `1.0`
 - Transport: JSON-RPC 2.0 over stdio; one JSON message per line (NDJSON)
 - Boundary: all clients use this protocol through `thais-sdk`; no client imports core internals
@@ -55,6 +55,7 @@ the result so the client can decide how to proceed.
 | `session.resume` | `session_id` | `session`, `checkpoint`, `pending_approvals` |
 | `session.set_model` | `session_id`, `role`, `model` | `session` |
 | `models.list` | none | `models` |
+| `history.search` | `query`, `session_id` optional, `workspace` optional, `limit` optional | `matches` (`event`, `session_name`, `workspace`) |
 
 A session object includes `session_id`, `name`, `workspace`, `mode`, `model`,
 `model_policy`, lifecycle `status`, timestamps, and cumulative
@@ -87,7 +88,12 @@ Event Log is retained. `session.archive` keeps it visible when
   minutes without renewal, and can be stolen only with `steal_lease: true`.
   Plan sessions never take it.
 - Session checkpoints are written under the data directory at
-  `sessions/<session_id>/checkpoint.md` with a machine-readable block.
+  `sessions/<session_id>/checkpoint.md` with a machine-readable block,
+  including the approved plan, derived tasks, compacted summary, and the last
+  sequence covered by that summary.
+- `history.search` queries the derived `events_fts` index and can filter by
+  session and workspace. `events` remains the source of truth; rebuilding
+  `events_fts` from it returns the same matches.
 
 ## Events
 
@@ -115,6 +121,9 @@ Event kinds in v1:
 | `session_created` | `session` |
 | `model_changed` | `role`, `model`, optional `reason` |
 | `budget_warning` | `turn_id`, `budget`, `used`, `limit` |
+| `context_rebuilt` | `turn_id`, `older_turns`, `kept_turns`, `last_compacted_seq`, `summary_chars` |
+| `context_rebuild_failed` | `turn_id`, `message` |
+| `memory_updated` | `turn_id`, `rule`, `diff` |
 | `snapshot_created` | `turn_id`, `commit` |
 | `rollback_completed` | `turn_id`, `paths` |
 | `verification_started` | `turn_id`, `commands` |
@@ -137,7 +146,9 @@ Event kinds in v1:
 M0 emits the session, turn, model, reasoning, approval, completion, cancellation,
 and error events. M1 adds read tools. M2 adds snapshots, rollback, verification,
 write/edit/patch, bash, and git read tools. M3 adds session lifecycle, model
-policy changes, budget warnings, and durable pending approvals.
+policy changes, budget warnings, and durable pending approvals. M4 adds
+approved project memory, context rebuilds, checkpoint summaries, and history
+search.
 
 ## Errors
 
@@ -183,6 +194,23 @@ Responses carry exactly one of `result` or `error`.
 - Usage and cost are recorded on `turn_completed`; the TUI status bar shows the
   most recent input/output tokens and USD cost. A per-turn cost budget emits
   `budget_warning` at 80% and stops at 100%.
+
+## M4 memory and continuity
+
+- `MEMORY.md` lives at the project root. The model can call `memory_write` only
+  in build mode; the permission gate asks for approval and shows a diff. The
+  write is atomic, duplicate-resistant, secret-rejecting, and capped at 2,000
+  estimated tokens.
+- `MEMORY.md` is included below project and global `AGENTS.md` in the prompt and
+  never overrides safety rules.
+- After each turn the runtime writes a checkpoint. Before a context rebuild it
+  writes a write-ahead checkpoint, then summarizes older turns and keeps the
+  most recent four turns verbatim.
+- Safety, `AGENTS.md`, the environment badge, and project memory are always
+  rebuilt into the prompt. Rebuild success emits `context_rebuilt`; failure
+  emits `context_rebuild_failed` and falls back to the checkpoint plus memory.
+- `history.search` searches the Event Log with optional session and workspace
+  filters.
 
 ## Security and trust
 

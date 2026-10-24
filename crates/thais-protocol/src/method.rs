@@ -31,3 +31,6 @@ pub const SESSION_RESUME: &str = "session.resume";
 pub const SESSION_SET_MODEL: &str = "session.set_model";
 /// List model catalog entries.
 pub const MODELS_LIST: &str = "models.list";
+
+/// Search the session Event Log with FTS5.
+pub const HISTORY_SEARCH: &str = "history.search";

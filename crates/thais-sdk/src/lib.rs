@@ -14,13 +14,13 @@ use thais_protocol::error::ProtocolError;
 use thais_protocol::jsonrpc::{Notification, Request, Response};
 use thais_protocol::method;
 use thais_protocol::session::{
-    InitializeParams, InitializeResult, ModelsListResult, SessionApproveParams,
-    SessionApproveResult, SessionArchiveParams, SessionArchiveResult, SessionCancelParams,
-    SessionCancelResult, SessionCreateParams, SessionCreateResult, SessionDeleteParams,
-    SessionDeleteResult, SessionGetParams, SessionGetResult, SessionListParams, SessionListResult,
-    SessionRenameParams, SessionRenameResult, SessionResumeParams, SessionResumeResult,
-    SessionSendParams, SessionSendResult, SessionSetModelParams, SessionSetModelResult,
-    SessionSubscribeParams, SessionSubscribeResult,
+    HistorySearchParams, HistorySearchResult, InitializeParams, InitializeResult, ModelsListResult,
+    SessionApproveParams, SessionApproveResult, SessionArchiveParams, SessionArchiveResult,
+    SessionCancelParams, SessionCancelResult, SessionCreateParams, SessionCreateResult,
+    SessionDeleteParams, SessionDeleteResult, SessionGetParams, SessionGetResult,
+    SessionListParams, SessionListResult, SessionRenameParams, SessionRenameResult,
+    SessionResumeParams, SessionResumeResult, SessionSendParams, SessionSendResult,
+    SessionSetModelParams, SessionSetModelResult, SessionSubscribeParams, SessionSubscribeResult,
 };
 use thiserror::Error;
 
@@ -191,6 +191,17 @@ impl<T: Transport> Client<T> {
     ) -> Result<SessionSetModelResult, SdkError> {
         let value = self
             .request(method::SESSION_SET_MODEL, serde_json::to_value(params)?)
+            .await?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    /// Search session history.
+    pub async fn history_search(
+        &self,
+        params: HistorySearchParams,
+    ) -> Result<HistorySearchResult, SdkError> {
+        let value = self
+            .request(method::HISTORY_SEARCH, serde_json::to_value(params)?)
             .await?;
         Ok(serde_json::from_value(value)?)
     }

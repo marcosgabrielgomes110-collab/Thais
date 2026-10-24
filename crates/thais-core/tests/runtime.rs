@@ -11,8 +11,8 @@ use thais_protocol::event::EventKind;
 use thais_protocol::jsonrpc::Request;
 use thais_protocol::method;
 use thais_protocol::session::{
-    ApprovalDecision, InitializeResult, ModelsListResult, SessionCreateResult, SessionListResult,
-    SessionMode, SessionResumeResult,
+    ApprovalDecision, HistorySearchParams, HistorySearchResult, InitializeResult, ModelsListResult,
+    SessionCreateResult, SessionListResult, SessionMode, SessionResumeResult,
 };
 use thais_providers::fake::{FakeProvider, FakeScript, FakeStep};
 
@@ -71,6 +71,31 @@ fn runtime_with_options(
         runtime = runtime.with_verifier(verifier);
     }
     Arc::new(runtime)
+}
+
+fn runtime_with_rebuild(
+    temp: &TempDir,
+    scripts: Vec<FakeScript>,
+    threshold: usize,
+    tail_turns: usize,
+) -> Arc<Runtime> {
+    let storage =
+        thais_storage::StorageHandle::open(temp.path().join("thais.db")).expect("storage");
+    let provider: Arc<dyn thais_providers::Provider> =
+        Arc::new(FakeProvider::with_scripts("fake", scripts));
+    Arc::new(
+        Runtime::new(
+            storage,
+            provider,
+            Arc::new(FixedClock::new("2026-10-23T00:00:00Z")),
+            Arc::new(SequenceIdGenerator::new("r")),
+            ContextManager::empty(),
+        )
+        .with_snapshot_base(temp.path().join("snapshots"))
+        .with_checkpoint_base(temp.path().join("sessions"))
+        .with_rebuild_threshold(threshold)
+        .with_history_tail_turns(tail_turns),
+    )
 }
 
 #[tokio::test]
@@ -832,6 +857,14 @@ async fn plan_mode_requires_approval_before_switching_to_build() {
             .mode,
         SessionMode::Build
     );
+    let checkpoint = std::fs::read_to_string(
+        temp.path()
+            .join("sessions")
+            .join(&session.session_id)
+            .join("checkpoint.md"),
+    )
+    .expect("checkpoint");
+    assert!(checkpoint.contains("Read the file."), "{checkpoint}");
 }
 
 #[tokio::test]
@@ -1102,4 +1135,247 @@ async fn per_turn_model_override_is_accepted_and_logged() {
     })
     .await
     .expect("turn completed");
+}
+
+#[tokio::test]
+async fn long_session_rebuilds_context_and_persists_a_summary() {
+    let temp = tempfile::tempdir().expect("temp");
+    let text = "context material ".repeat(40);
+    let runtime = runtime_with_rebuild(
+        &temp,
+        vec![
+            script(vec![FakeStep::Text { text: text.clone() }]),
+            script(vec![FakeStep::Text { text: text.clone() }]),
+            script(vec![FakeStep::Text { text: text.clone() }]),
+        ],
+        80,
+        1,
+    );
+    let session = runtime
+        .create_session(
+            temp.path().to_string_lossy().into_owned(),
+            SessionMode::Build,
+            None,
+        )
+        .await
+        .expect("create");
+
+    for input in ["first task", "second task", "third task"] {
+        let mut live = runtime.subscribe_live();
+        runtime
+            .send(&session.session_id, input.to_owned(), None)
+            .await
+            .expect("send");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let event = live.recv().await.expect("event");
+                if event.session_id == session.session_id
+                    && matches!(event.kind, EventKind::TurnCompleted | EventKind::Error)
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("turn complete");
+    }
+
+    let replay = runtime
+        .replay_session(&session.session_id)
+        .await
+        .expect("replay");
+    assert!(
+        replay
+            .events
+            .iter()
+            .any(|event| event.kind == EventKind::ContextRebuilt),
+        "expected a rebuild event"
+    );
+    assert!(
+        replay
+            .events
+            .iter()
+            .any(|event| event.kind == EventKind::ContextRebuildFailed),
+        "expected a safe fallback before the first successful rebuild"
+    );
+    let checkpoint = std::fs::read_to_string(
+        temp.path()
+            .join("sessions")
+            .join(&session.session_id)
+            .join("checkpoint.md"),
+    )
+    .expect("checkpoint");
+    assert!(checkpoint.contains("Compacted"), "{checkpoint}");
+    let resumed = runtime
+        .resume_session(&session.session_id)
+        .await
+        .expect("resume");
+    assert!(
+        resumed
+            .checkpoint
+            .and_then(|checkpoint| checkpoint.summary)
+            .is_some(),
+        "resume should expose the compacted summary"
+    );
+}
+
+#[tokio::test]
+async fn memory_write_is_gated_and_recorded() {
+    let temp = tempfile::tempdir().expect("temp");
+    let runtime = runtime(
+        &temp,
+        script(vec![FakeStep::ToolCall {
+            index: 0,
+            id: "call_memory".to_owned(),
+            name: "memory_write".to_owned(),
+            arguments: json!({"rule": "Always run make check"}).to_string(),
+        }]),
+    );
+    let session = runtime
+        .create_session(
+            temp.path().to_string_lossy().into_owned(),
+            SessionMode::Build,
+            None,
+        )
+        .await
+        .expect("create");
+    let mut live = runtime.subscribe_live();
+    runtime
+        .send(&session.session_id, "remember this".to_owned(), None)
+        .await
+        .expect("send");
+
+    let approval_id = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let event = live.recv().await.expect("event");
+            if event.kind == EventKind::PermissionRequested {
+                break event.payload["approval_id"]
+                    .as_str()
+                    .expect("approval id")
+                    .to_owned();
+            }
+        }
+    })
+    .await
+    .expect("permission requested");
+    assert!(
+        runtime
+            .approve(&session.session_id, &approval_id, ApprovalDecision::Allow)
+            .await
+            .expect("approve")
+    );
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let event = live.recv().await.expect("event");
+            if event.kind == EventKind::MemoryUpdated {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("memory updated");
+    let memory = std::fs::read_to_string(temp.path().join("MEMORY.md")).expect("memory");
+    assert!(memory.contains("Always run make check"));
+    let replay = runtime
+        .replay_session(&session.session_id)
+        .await
+        .expect("replay");
+    assert!(replay.events.iter().any(|event| {
+        event.kind == EventKind::PermissionResolved
+            && event
+                .payload
+                .get("decision")
+                .and_then(serde_json::Value::as_str)
+                == Some("allow")
+    }));
+}
+
+#[tokio::test]
+async fn history_search_filters_sessions_and_survives_fts_rebuild() {
+    let temp = tempfile::tempdir().expect("temp");
+    let runtime = runtime(
+        &temp,
+        script(vec![FakeStep::Text {
+            text: "unique decision phrase".to_owned(),
+        }]),
+    );
+    let session = runtime
+        .create_session(
+            temp.path().to_string_lossy().into_owned(),
+            SessionMode::Build,
+            None,
+        )
+        .await
+        .expect("create");
+    let mut live = runtime.subscribe_live();
+    runtime
+        .send(
+            &session.session_id,
+            "remember the unique decision phrase".to_owned(),
+            None,
+        )
+        .await
+        .expect("send");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let event = live.recv().await.expect("event");
+            if event.session_id == session.session_id && event.kind == EventKind::TurnCompleted {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("turn complete");
+    let matches = runtime
+        .history_search(HistorySearchParams {
+            query: "unique".to_owned(),
+            session_id: Some(session.session_id.clone()),
+            workspace: Some(temp.path().to_string_lossy().into_owned()),
+            limit: Some(10),
+        })
+        .await
+        .expect("search");
+    assert!(!matches.matches.is_empty());
+    let storage =
+        thais_storage::StorageHandle::open(temp.path().join("thais.db")).expect("storage");
+    storage.rebuild_fts().await.expect("rebuild fts");
+    let matches2 = runtime
+        .history_search(HistorySearchParams {
+            query: "unique".to_owned(),
+            session_id: Some(session.session_id.clone()),
+            workspace: None,
+            limit: Some(10),
+        })
+        .await
+        .expect("search after rebuild");
+    assert_eq!(matches.matches.len(), matches2.matches.len());
+
+    let other = runtime
+        .create_session(
+            temp.path().to_string_lossy().into_owned(),
+            SessionMode::Plan,
+            None,
+        )
+        .await
+        .expect("other session");
+    let isolated = runtime
+        .history_search(HistorySearchParams {
+            query: "unique".to_owned(),
+            session_id: Some(other.session_id),
+            workspace: None,
+            limit: Some(10),
+        })
+        .await
+        .expect("isolated search");
+    assert!(isolated.matches.is_empty());
+
+    let request = Request::new(
+        12_i64,
+        method::HISTORY_SEARCH,
+        json!({"query": "unique", "session_id": session.session_id}),
+    );
+    let outcome = runtime.handle_request(request).await;
+    let result: HistorySearchResult = outcome.response.result_as().expect("history result");
+    assert!(!result.matches.is_empty());
+    assert_eq!(result.matches[0].session_name, session.name);
 }

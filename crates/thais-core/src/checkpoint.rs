@@ -26,7 +26,14 @@ pub struct CheckpointState {
     /// Approved plan, when present.
     pub plan: Option<String>,
     /// Task list.
+    #[serde(default)]
     pub tasks: Vec<String>,
+    /// Compacted summary of older turns.
+    #[serde(default)]
+    pub summary: Option<String>,
+    /// Last sequence number included in the compacted summary.
+    #[serde(default)]
+    pub last_compacted_seq: u64,
     /// RFC 3339 update time.
     pub updated_at: String,
 }
@@ -39,6 +46,7 @@ impl CheckpointState {
             state: self.state.clone(),
             plan: self.plan.clone(),
             tasks: self.tasks.clone(),
+            summary: self.summary.clone(),
         }
     }
 }
@@ -114,6 +122,8 @@ mod tests {
             state: "active".to_owned(),
             plan: Some("plan".to_owned()),
             tasks: vec!["one".to_owned()],
+            summary: Some("older".to_owned()),
+            last_compacted_seq: 7,
             updated_at: "2026-10-23T00:00:00Z".to_owned(),
         };
         write_checkpoint(&path, &state).expect("write");
@@ -121,5 +131,7 @@ mod tests {
         assert_eq!(loaded.session_id, "s-1");
         assert_eq!(loaded.mode, SessionMode::Build);
         assert_eq!(loaded.tasks, ["one"]);
+        assert_eq!(loaded.last_compacted_seq, 7);
+        assert_eq!(loaded.summary.as_deref(), Some("older"));
     }
 }

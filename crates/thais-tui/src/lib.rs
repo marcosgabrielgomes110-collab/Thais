@@ -347,6 +347,25 @@ impl AppState {
                     .push_str(&format!("\n[{budget} budget warning]\n"));
                 self.status = "budget warning".to_owned();
             }
+            EventKind::ContextRebuilt => {
+                self.transcript.push_str("\n[context rebuilt]\n");
+                self.status = "context rebuilt".to_owned();
+            }
+            EventKind::ContextRebuildFailed => {
+                self.transcript
+                    .push_str("\n[context rebuild failed; using checkpoint]\n");
+                self.status = "rebuild fallback".to_owned();
+            }
+            EventKind::MemoryUpdated => {
+                let rule = event
+                    .payload
+                    .get("rule")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("rule");
+                self.transcript
+                    .push_str(&format!("\n[memory] {}\n", truncate(rule, 200)));
+                self.status = "memory updated".to_owned();
+            }
         }
     }
 }

@@ -58,6 +58,7 @@ impl PermissionGate {
             "edit",
             "apply_patch",
             "bash",
+            "memory_write",
         ];
         if !KNOWN.contains(&tool) {
             return PermissionDecision::Deny(format!("tool `{tool}` is not available"));

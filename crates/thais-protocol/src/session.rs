@@ -374,6 +374,9 @@ pub struct CheckpointSummary {
     /// Derived task list.
     #[serde(default)]
     pub tasks: Vec<String>,
+    /// Compacted summary of older turns.
+    #[serde(default)]
+    pub summary: Option<String>,
 }
 
 /// Result of `session.resume`.
@@ -429,4 +432,38 @@ pub struct ModelInfo {
 pub struct ModelsListResult {
     /// Available models.
     pub models: Vec<ModelInfo>,
+}
+
+/// Parameters for `history.search`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistorySearchParams {
+    /// FTS5 query.
+    pub query: String,
+    /// Optional session filter.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// Optional workspace filter.
+    #[serde(default)]
+    pub workspace: Option<String>,
+    /// Maximum number of matches.
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+/// One history search hit with its session label.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistoryMatch {
+    /// Matching event.
+    pub event: crate::event::EventEnvelope,
+    /// Session name.
+    pub session_name: String,
+    /// Canonical workspace.
+    pub workspace: String,
+}
+
+/// Result of `history.search`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistorySearchResult {
+    /// Matching events.
+    pub matches: Vec<HistoryMatch>,
 }
