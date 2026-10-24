@@ -307,6 +307,7 @@ Ainda falta para fechar o M6:
 | Documento | Conteúdo |
 |---|---|
 | [docs/protocol.md](docs/protocol.md) | Agent API, métodos, eventos e fluxo de build |
+| [docs/security.md](docs/security.md) | modelo de segurança, sandbox e riscos residuais |
 | [ROADMAP.md](ROADMAP.md) | marcos, critérios de aceite e decisões |
 | [docs/adr/](docs/adr/) | Architecture Decision Records |
 | [docs/providers.example.toml](docs/providers.example.toml) | providers e presets |
