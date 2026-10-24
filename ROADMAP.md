@@ -58,7 +58,7 @@ Rules:
 - LSP diagnostics and MCP tools.
 - Explore and general subagents with bounded budgets.
 - TUI plus a VS Code extension using the same API.
-- Installable binaries for Linux, macOS, and Windows.
+- Installable binaries for Linux.
 - No telemetry in v1.
 
 Alpha is the first usable slice: M0 + M1 + M2 + a simple checkpoint. The remaining items follow Alpha, not before it.
@@ -98,7 +98,7 @@ Alpha is the first usable slice: M0 + M1 + M2 + a simple checkpoint. The remaini
 | Testing | `cargo-nextest`, `insta`, `wiremock`, `proptest` |
 | Packaging | `cargo-dist`, Homebrew, Scoop, Docker |
 
-Rust is the decided stack. The specific crates are starting points to validate in M0 spikes on SQLite FTS5, PTY on Windows, and provider streaming.
+Rust is the decided stack. The specific crates are starting points to validate in M0 spikes on SQLite FTS5, PTY on Linux, and provider streaming.
 
 ## Developer workflow
 
@@ -128,28 +128,28 @@ Rules:
 - `make lint` is read-only. `make fmt` rewrites files.
 - `make` is the safe default: setup, format check, lint, test, and build.
 - `make ci` is the single source of truth; CI calls it instead of duplicating commands.
-- Use `mkdir -p $(BINDIR)` and `install -m 0755`, not GNU-only `install -D`, so macOS/BSD work.
+- Use `mkdir -p $(BINDIR)` and `install -m 0755`, not GNU-only `install -D`.
 - `make install PREFIX=/usr/local` may need `sudo`; do not put `sudo` inside the Makefile.
 - `make uninstall` removes the binary only. Configuration, credentials, sessions, and memory are preserved; print a note.
 - Include `.PHONY` targets and keep a `make help` that lists every target.
 - Use `.editorconfig` to enforce tabs in the `Makefile`.
 - Pin the toolchain with `rust-toolchain.toml`.
-- Windows uses Git Bash or WSL for v1; a native equivalent is a later task.
+- Linux is the v1 platform.
 - Build metadata (version, commit, date) comes from `vergen` or a build script.
 
 ## Storage and credentials
 
 ### Directory layout
 
-Thais follows the XDG base directory convention on Linux and the native equivalents on macOS and Windows.
+Thais follows the XDG base directory convention on Linux.
 
-| Purpose | Linux | macOS | Windows | Contents |
-|---|---|---|---|---|
-| Config | `~/.config/thais/` | `~/Library/Application Support/Thais/config/` | `%APPDATA%\Thais\config\` | `config.toml`, `providers.toml`, `models.toml`; no secrets |
-| Data | `~/.local/share/thais/` | `~/Library/Application Support/Thais/data/` | `%LOCALAPPDATA%\Thais\data\` | `thais.db`, workspace trust, `sessions/`, `snapshots/`, plugins |
-| State | `~/.local/state/thais/` | `~/Library/Logs/Thais/` | `%LOCALAPPDATA%\Thais\state\` | logs, crash reports, diagnostics |
-| Cache | `~/.cache/thais/` | `~/Library/Caches/Thais/` | `%LOCALAPPDATA%\Thais\cache\` | downloads, model catalog cache, rebuildable artifacts |
-| Project | `<repo>/.thais/` | `<repo>/.thais/` | `<repo>\.thais\` | untrusted project `config.toml`, `MEMORY.md` |
+| Purpose | Linux | Contents |
+|---|---|---|
+| Config | `~/.config/thais/` | `config.toml`, `providers.toml`, `models.toml`; no secrets |
+| Data | `~/.local/share/thais/` | `thais.db`, workspace trust, `sessions/`, `snapshots/`, plugins |
+| State | `~/.local/state/thais/` | logs, crash reports, diagnostics |
+| Cache | `~/.cache/thais/` | downloads, model catalog cache, rebuildable artifacts |
+| Project | `<repo>/.thais/` | untrusted project `config.toml`, `MEMORY.md` |
 
 Rules:
 
@@ -183,7 +183,7 @@ API keys never live in `config.toml`, `providers.toml`, `models.toml`, project c
 | Priority | Store | Notes |
 |---|---|---|
 | 1 | Environment | `THAIS_<PROVIDER>_API_KEY` for CI, headless use, and explicit overrides |
-| 2 | OS keyring | Secret Service/libsecret on Linux, Keychain on macOS, Credential Manager on Windows |
+| 2 | OS keyring | Secret Service/libsecret on Linux |
 | 3 | 0600 file | `~/.config/thais/credentials.toml`, only when the keyring is unavailable; warn on use |
 
 Rules:
@@ -436,7 +436,7 @@ Estimates assume one developer with systems experience but new to Rust and this 
 
 ## Current focus
 
-**M7 is done and tagged (`v0.8.0-m7`).** M0 through M6 are tagged (`v0.7.0-m6`). The productization path includes the WebSocket daemon, multi-client events, `events --follow`, the VS Code extension, packaging metadata, Docker, install docs, and a changelog. The v1.0 stable gate still tracks Seatbelt, Job Objects, PTY/ConPTY, Windows tests, fuzzing/loom, signing/SBOM, and the performance pass.
+**M7 is done and tagged (`v0.8.0-m7`).** M0 through M6 are tagged (`v0.7.0-m6`). The productization path includes the WebSocket daemon, multi-client events, `events --follow`, the VS Code extension, packaging metadata, Docker, install docs, and a changelog. The v1.0 stable gate is scoped to **Linux only** and still tracks fuzzing/loom, signing/SBOM, and the performance pass. macOS and Windows are post-v1.
 
 Alpha is the first daily-use release: M0 + M1 + M2 + a simple checkpoint. The next gate is a developer using Alpha on a real repository for a week without losing work.
 
@@ -476,7 +476,7 @@ Alpha is the first daily-use release: M0 + M1 + M2 + a simple checkpoint. The ne
 - The rollback spike documents how bash changes are captured and where best-effort restore stops.
 - A fresh clone succeeds with `make`; `make lint` and `make test` pass.
 - `make install PREFIX=$(mktemp -d)` installs the binary and `make uninstall` removes it.
-- CI calls `make ci`; Linux and macOS are validated, and the Windows path is documented.
+- CI calls `make ci` on Linux.
 - Protocol contract tests and concurrency tests pass in CI.
 
 **Out of scope:** Real models, file edits, memory, LSP/MCP, subagents, UI polish.
@@ -702,7 +702,7 @@ servers must already be installed by the user.
 
 ### M6 — Hardening
 
-**Status:** Done for Linux (`v0.7.0-m6`); stable cross-platform pending.
+**Status:** Done for Linux (`v0.7.0-m6`). macOS and Windows are post-v1.
 
 **Goal:** Make the product safe and reliable across platforms before calling it v1.
 
@@ -710,9 +710,9 @@ servers must already be installed by the user.
 
 **Deliverables:**
 
-- Sandbox: the workspace path jail and command policy are not a sandbox. Add Linux Landlock/seccomp, macOS Seatbelt, and Windows Job Objects; optional container mode. From M6, enforce the OS sandbox by default where available, with an explicit per-workspace opt-out and a warning ([ADR-0008](docs/adr/0008-sandbox-default.md)). When the sandbox is unavailable or disabled, bash remains `ask`-only and allow-always/prefix allowlists stay disabled. Only with an active sandbox may bash policy allow always or prefix allowlists.
-- Cross-platform PTY/ConPTY with `portable-pty`, process groups, paths, signals, and line endings.
-- CI matrix for Linux, macOS, and Windows; concurrency tests with `loom` where needed and protocol fuzzing with `cargo-fuzz`.
+- Sandbox: the workspace path jail and command policy are not a sandbox. Add Linux Landlock/seccomp; optional container mode. From M6, enforce the OS sandbox by default where available, with an explicit per-workspace opt-out and a warning ([ADR-0008](docs/adr/0008-sandbox-default.md)). When the sandbox is unavailable or disabled, bash remains `ask`-only and allow-always/prefix allowlists stay disabled. Only with an active sandbox may bash policy allow always or prefix allowlists.
+- PTY with `portable-pty`, process groups, paths, signals, and line endings.
+- CI for Linux; concurrency tests with `loom` where needed and protocol fuzzing with `cargo-fuzz`.
 - Secret redaction across events, prompts, tool output, and errors.
 - Credential hardening: keyring backend detection, symlink-safe `0600` fallback, secret scanning in logs, key-exfiltration tests, and permission checks.
 - Prompt-injection tests for repository content, tool output, MCP responses, memory, `AGENTS.md`, and project config.
@@ -725,7 +725,7 @@ servers must already be installed by the user.
 
 - A security checklist is complete, including gate bypass and secret-leak tests.
 - The sandbox is on by default where supported; disabling it is explicit, warned, and keeps bash `ask`-only.
-- End-to-end tests pass on Linux, macOS, and Windows.
+- End-to-end tests pass on Linux.
 - An interrupted session recovers without duplicate mutations.
 - No secret appears in the event log, the search index, or the prompt.
 - Protocol fuzzing and concurrency tests pass.
@@ -736,9 +736,8 @@ with a Landlock + seccomp helper fallback (`thais-sandbox`) that restricts
 filesystem access, denies TCP, and blocks dangerous syscalls;
 `THAIS_SANDBOX=auto|off|required`; tool-output redaction; expanded secret
 patterns; prompt-injection tests; idempotent event append; symlink-safe private
-writes; lease recovery; and a bounded TUI transcript. Stable cross-platform
-work remains: Seatbelt, Job Objects, PTY/ConPTY, Windows tests, fuzzing/loom,
-environment-leak coverage, and the performance pass.
+writes; lease recovery; and a bounded TUI transcript. Stable Linux work remains:
+fuzzing/loom, environment-leak coverage, signing/SBOM, and the performance pass.
 
 **Out of scope:** Formal verification, multi-user authentication, cloud isolation.
 
@@ -772,8 +771,7 @@ environment-leak coverage, and the performance pass.
 **Implementation notes:** M7 adds the local WebSocket daemon with token auth
 and multi-client event fan-out, `thais events --follow`, a VS Code extension
 scaffold, cargo-dist metadata, Dockerfile, install documentation, and a
-changelog. Signed artifacts, SBOM generation, and the stable cross-platform
-matrix remain release-gate work.
+changelog. Signed artifacts and SBOM generation remain release-gate work.
 
 **Out of scope:** Cloud sync, team workspaces, multi-user server.
 
@@ -852,7 +850,7 @@ matrix remain release-gate work.
 
 | Risk | Impact | Mitigation |
 |---|---|---|
-| Sandbox and cross-platform PTY are harder than expected | Delays v1 security goals | Start with path jail and command policy, explicitly not isolation; add OS sandbox in M6; spike Windows ConPTY in M0 |
+| Sandbox and PTY are harder than expected | Delays v1 security goals | Start with path jail and command policy, explicitly not isolation; add OS sandbox in M6; spike PTY in M0 |
 | Bash without a real sandbox | Host compromise or data exfiltration | Path jail is not a sandbox; bash is always `ask`; no allow-always or prefix allowlists before M6 |
 | Project config trust escalation | Repo controls providers, policy, verifier, or sandbox | Treat project config as untrusted; trust only in Data by path + config hash; gate verifier commands; key-exfiltration tests |
 | Bash rollback is best-effort | Partial or missed restore | Spike shadow Git or pre/post hashes in M0/M2; mark unverified; report when restore is incomplete |
@@ -876,7 +874,7 @@ matrix remain release-gate work.
 | Model switch to a weaker model | Silent quality drop | Explicit policy, logged fallback, capability checks, user-visible status |
 | Keyring unavailable on headless Linux or CI | Auth fails or insecure fallback | Environment auth for CI, `0600` file with warning, `thais doctor` detection, documented precedence |
 | Local and CI command drift | “Works on my machine” releases | `make ci` is the single source; CI calls it; no duplicated command lists |
-| GNU-only install flags break macOS/BSD | Install target fails | `mkdir -p` plus `install -m 0755`; test on macOS in M6 |
+| GNU-only install flags break portability | Install target fails | `mkdir -p` plus `install -m 0755` |
 
 ## Decisions
 
@@ -933,7 +931,7 @@ There are no open v1 decisions. The next decision that needs a choice gets a new
 | 2026-10-23 | Unified Event Log and FTS5 in `thais.db`; `events` is append-only with triggers |
 | 2026-10-23 | Closed all open decisions; added ADRs and aligned scope, providers, second client, retention, telemetry, sandbox, and TUI tables |
 | 2026-10-23 | Implemented the M0 foundation: workspace, protocol v1, storage, credentials, fake runtime, CLI, tests, protocol docs, rollback spike, and CI |
-| 2026-10-23 | M0 accepted by CI on Linux/macOS, Windows check, and audit; tagged `v0.1.0-m0` |
+| 2026-10-23 | M0 accepted by CI on Linux and audit; tagged `v0.1.0-m0` |
 | 2026-10-23 | Implemented the M1 read-only loop: Cohere/OpenAI-compatible provider, context manager, environment badge, AGENTS.md, read tools, gate, parallel tool execution, TUI, and budgets |
 | 2026-10-23 | Implemented M3 sessions and models: lifecycle, checkpoints, workspace leases, provider registry, model catalog/roles, Anthropic adapter, cost budgets, TUI switcher, and CLI commands |
 | 2026-10-24 | Implemented M4 memory and continuity: approved MEMORY.md writes, checkpoint tasks/summaries, context rebuild with fallback, and FTS history search |
@@ -943,4 +941,4 @@ There are no open v1 decisions. The next decision that needs a choice gets a new
 | 2026-10-24 | Closed M7: WebSocket daemon, token auth, multi-client events, VS Code scaffold, packaging metadata, Docker, install docs, and changelog |
 | 2026-10-23 | Implemented the M2 build loop: write/edit/apply_patch, bash, git read tools, shadow-Git snapshots, rollback, verifier, plan approval, diff previews, personality file, and audit events |
 | 2026-10-23 | M1 accepted by CI; M2 implementation started |
-| 2026-10-23 | M2 accepted by CI on Linux/macOS, Windows check, and audit; tagged `v0.3.0-m2`; M1 tagged `v0.2.0-m1` |
+| 2026-10-23 | M2 accepted by CI on Linux and audit; tagged `v0.3.0-m2`; M1 tagged `v0.2.0-m1` |

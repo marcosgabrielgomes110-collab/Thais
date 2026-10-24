@@ -7,11 +7,11 @@
 
 ## Context
 
-The workspace path jail is not an OS sandbox. Bash can read, write, and reach the network outside the workspace. Linux, macOS, and Windows offer different sandbox primitives, and some environments cannot support them.
+The workspace path jail is not an OS sandbox. Bash can read, write, and reach the network outside the workspace. Linux offers sandbox primitives; macOS and Windows are post-v1, and some environments cannot support them.
 
 ## Decision
 
-- From M6, Thais enforces the OS sandbox by default where available: Linux Landlock/seccomp, macOS Seatbelt, and Windows Job Objects.
+- From M6, Thais enforces the OS sandbox by default where available: Linux Landlock/seccomp.
 - The user can opt out per workspace or session only with an explicit, warned setting.
 - When the sandbox is unavailable or disabled, bash remains `ask`-only and allow-always/prefix allowlists stay disabled.
 - Container mode is optional, not the default.

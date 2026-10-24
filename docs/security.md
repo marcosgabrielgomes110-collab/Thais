@@ -26,7 +26,7 @@ The runtime auto-detects a Linux backend:
 
 - Linux without `bwrap`: no OS sandbox; `bash` is still gated but can read/write outside the workspace and reach the network.
 - The Linux sandbox uses namespaces and/or Landlock plus a seccomp denylist; it is not a complete syscall allowlist.
-- macOS Seatbelt and Windows Job Objects are deferred to the stable release; macOS tests run the fallback path.
+- macOS and Windows are post-v1; their sandbox backends are not part of the Linux v1.0 gate.
 - Landlock is not available on kernels older than 5.13; fallback remains unsandboxed but gated.
 - Shell commands may spawn descendants; process-group cleanup is best-effort after timeout/cancel.
 - Snapshots honor `.gitignore`; ignored files and bash changes are best-effort.
@@ -37,4 +37,4 @@ The runtime auto-detects a Linux backend:
 
 - `make check` includes fmt, clippy, tests, and the architecture boundary.
 - Tests cover redaction before model/log, sandbox fallback, required-sandbox refusal, gate behavior, and lease release.
-- CI runs Linux/macOS tests, Windows check, and dependency audit.
+- CI runs Linux tests and dependency audit.

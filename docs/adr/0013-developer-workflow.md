@@ -7,7 +7,7 @@
 
 ## Context
 
-A single developer needs one reliable entry point for local work and CI. Install should not require root by default. Commands must work on macOS and BSD as well as Linux.
+A single developer needs one reliable entry point for local work and CI. Install should not require root by default. Commands must work on Linux.
 
 ## Decision
 
@@ -18,13 +18,13 @@ A single developer needs one reliable entry point for local work and CI. Install
 - Do not put `sudo` in the Makefile.
 - `make uninstall` removes the binary only and preserves configuration, credentials, sessions, and memory.
 - Use `.editorconfig` with tabs for the Makefile and pin the toolchain with `rust-toolchain.toml`.
-- Windows uses Git Bash or WSL for v1; a native equivalent is later.
+- Linux is the v1 platform.
 
 ## Consequences
 
 - Consistent local and CI behavior.
 - User-local install needs no root.
-- Windows-native install work is deferred.
+- Windows and macOS are post-v1.
 - The Makefile and docs must stay in sync.
 
 ## Alternatives considered

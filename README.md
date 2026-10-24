@@ -16,7 +16,7 @@
   <img src="https://img.shields.io/badge/rust-1.99.1-b7410e?logo=rust&logoColor=white" alt="Rust 1.99.1" />
   <img src="https://img.shields.io/badge/local--first-yes-2f6f5e" alt="Local-first" />
   <img src="https://img.shields.io/badge/telemetry-none-2f6f5e" alt="No telemetry" />
-  <img src="https://img.shields.io/badge/status-M6%20in%20progress-6f42c1" alt="M6 in progress" />
+  <img src="https://img.shields.io/badge/status-Linux%20v1-6f42c1" alt="Linux v1" />
 </p>
 
 ---
@@ -278,9 +278,8 @@ thais events --follow
 | M6 — Hardening | Done no Linux | `v0.7.0-m6` |
 | M7 — Productization | Done | `v0.8.0-m7` |
 
-O Alpha continua sendo o gate de feedback em repositório real. O **M6** está
-em andamento: a primeira camada já está no `main`, mas o marco ainda não foi
-fechado.
+O Alpha continua sendo o gate de feedback em repositório real. O **M6 está
+fechado no Linux**; o escopo do v1.0 é **somente Linux**.
 
 ### M6 hardening — Linux
 
@@ -306,11 +305,10 @@ Já implementado:
 - Extensão VS Code em `extensions/vscode`: conectar, criar sessão, enviar task,
   trocar sessão, escolher modelo e aprovar ações.
 - `dist-workspace.toml`, `Dockerfile`, `docs/install.md` e `CHANGELOG.md`.
-- Empacotamento preparado para Linux, macOS e Windows; assinatura e SBOM ficam
-  no checklist do release stable.
+- Empacotamento Linux, Docker e extensão VS Code.
 
-O stable cross-platform ainda precisa de Seatbelt, Job Objects, PTY/ConPTY,
-matriz de testes Windows, fuzzing/loom e o pass de performance.
+O gate v1.0 Linux ainda precisa de fuzzing/loom, assinatura/SBOM e do pass de
+performance. macOS e Windows ficam fora do escopo do v1.0.
 
 ## Documentação
 
@@ -338,7 +336,7 @@ cargo deny check
 scripts/release.sh v0.8.0-m7
 ```
 
-A CI roda em Linux, macOS e Windows (check), além de audit de dependências.
+A CI roda em Linux, além de audit de dependências.
 `thais-tui` depende apenas de `thais-sdk` e `thais-protocol`; o boundary é
 testado, não apenas documentado.
 

@@ -20,9 +20,9 @@ docker run --rm -it -v "$PWD:/work" -w /work thais run --task "hello"
 
 ## Release artifacts
 
-`dist-workspace.toml` defines cargo-dist targets for Linux, macOS, and Windows,
-plus shell, Homebrew, PowerShell, and MSI installers. Release artifacts should
-include checksums and an SBOM; signing is part of the stable release gate.
+`dist-workspace.toml` defines cargo-dist targets for Linux with a shell
+installer. Release artifacts include checksums and an SBOM; signing is part of
+the stable release gate.
 
 ## First task
 
