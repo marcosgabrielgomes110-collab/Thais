@@ -176,6 +176,7 @@ fn detect_backend() -> SandboxBackend {
     SandboxBackend::None
 }
 
+#[cfg(target_os = "linux")]
 fn helper_path() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("THAIS_SANDBOX_HELPER") {
         let path = PathBuf::from(path);
