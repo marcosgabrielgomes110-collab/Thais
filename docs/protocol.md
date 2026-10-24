@@ -100,8 +100,8 @@ Event kinds in v1:
 | `error` | `turn_id`, `message` |
 
 M0 emits the session, turn, model, reasoning, approval, completion, cancellation,
-and error events. Tool events are defined now and exercised by the fake runtime;
-real tool execution arrives in M1 and M2.
+and error events. Tool events are defined now; real tool execution arrives in
+M1 and M2.
 
 ## Errors
 
