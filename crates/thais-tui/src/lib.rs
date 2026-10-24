@@ -26,7 +26,8 @@ use thais_protocol::method;
 use thais_protocol::session::{
     ApprovalDecision, InitializeParams, SessionApproveParams, SessionArchiveParams,
     SessionCancelParams, SessionCreateParams, SessionDeleteParams, SessionInfo, SessionListParams,
-    SessionMode, SessionResumeParams, SessionSendParams, SessionSubscribeParams,
+    SessionMode, SessionReleaseLeaseParams, SessionResumeParams, SessionSendParams,
+    SessionSubscribeParams,
 };
 use thais_sdk::{Client, Transport};
 use tokio::sync::mpsc;
@@ -75,6 +76,11 @@ pub async fn run<T: Transport + 'static>(
     let mut terminal = Terminal::new(backend).context("terminal")?;
 
     let result = event_loop(&mut terminal, &client, &mut app, &mut notifications).await;
+    let _ = client
+        .session_release_lease(SessionReleaseLeaseParams {
+            session_id: app.session_id.clone(),
+        })
+        .await;
 
     let _ = disable_raw_mode();
     let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
@@ -549,6 +555,11 @@ async fn handle_picker_key<T: Transport>(
             let Some(session) = app.sessions.get(selected).cloned() else {
                 return Ok(());
             };
+            let _ = client
+                .session_release_lease(SessionReleaseLeaseParams {
+                    session_id: app.session_id.clone(),
+                })
+                .await;
             let resumed = client
                 .session_resume(SessionResumeParams {
                     session_id: session.session_id.clone(),

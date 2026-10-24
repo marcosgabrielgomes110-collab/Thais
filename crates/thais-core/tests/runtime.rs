@@ -1379,3 +1379,24 @@ async fn history_search_filters_sessions_and_survives_fts_rebuild() {
     assert!(!result.matches.is_empty());
     assert_eq!(result.matches[0].session_name, session.name);
 }
+
+#[tokio::test]
+async fn releasing_a_lease_allows_the_next_mutating_session() {
+    let temp = tempfile::tempdir().expect("temp");
+    let runtime = runtime(&temp, script(vec![]));
+    let workspace = temp.path().to_string_lossy().into_owned();
+    let first = runtime
+        .create_session(workspace.clone(), SessionMode::Build, None)
+        .await
+        .expect("first");
+    assert!(
+        runtime
+            .release_session_lease(&first.session_id)
+            .await
+            .expect("release")
+    );
+    runtime
+        .create_session(workspace, SessionMode::Build, None)
+        .await
+        .expect("second after release");
+}

@@ -289,6 +289,7 @@ The workspace is a Rust workspace with a single `thais` binary and a
 | `make run ARGS="sessions --all"` | List persisted sessions, including archived ones |
 | `make run ARGS="models"` | List the provider/model catalog from user config |
 | `make run ARGS="history \"decision\""` | Search the Event Log with FTS5 |
+| `make run ARGS="lease release"` | Release the current workspace lease |
 | `make tools` | Install `cargo-nextest`, `cargo-audit`, and `cargo-deny` |
 | `make install PREFIX=...` | Install the binary; `make uninstall` removes only the binary |
 
@@ -317,7 +318,9 @@ thais tui --provider cohere
 The TUI keys are: `Enter` send, `Esc` cancel the active turn (or quit when idle),
 `PageUp`/`PageDown` scroll, `Ctrl+S` open the session switcher, `Ctrl+C` quit,
 and `y`/`n` for approval prompts. In the switcher, `Up`/`Down` select,
-`Enter` resumes, `a` archives, `x` soft-deletes, and `Esc` closes.
+`Enter` resumes, `a` archives, `x` soft-deletes, and `Esc` closes. The TUI
+releases its workspace lease on exit and when switching sessions; if a process
+is killed, use `thais lease release --workspace <repo>`.
 The headless `thais run` command prints model text to stdout and logs to stderr;
 `--json` emits the NDJSON event stream.
 

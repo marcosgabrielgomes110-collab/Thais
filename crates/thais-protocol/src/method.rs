@@ -34,3 +34,6 @@ pub const MODELS_LIST: &str = "models.list";
 
 /// Search the session Event Log with FTS5.
 pub const HISTORY_SEARCH: &str = "history.search";
+
+/// Release a session's workspace lease.
+pub const SESSION_RELEASE_LEASE: &str = "session.release_lease";

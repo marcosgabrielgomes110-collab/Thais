@@ -21,9 +21,10 @@ use thais_protocol::session::{
     SessionArchiveParams, SessionArchiveResult, SessionCancelParams, SessionCancelResult,
     SessionCreateParams, SessionCreateResult, SessionDeleteParams, SessionDeleteResult,
     SessionGetParams, SessionGetResult, SessionInfo, SessionListParams, SessionListResult,
-    SessionMode, SessionRenameParams, SessionRenameResult, SessionResumeParams,
-    SessionResumeResult, SessionSendParams, SessionSendResult, SessionSetModelParams,
-    SessionSetModelResult, SessionStatus, SessionSubscribeParams, SessionSubscribeResult,
+    SessionMode, SessionReleaseLeaseParams, SessionReleaseLeaseResult, SessionRenameParams,
+    SessionRenameResult, SessionResumeParams, SessionResumeResult, SessionSendParams,
+    SessionSendResult, SessionSetModelParams, SessionSetModelResult, SessionStatus,
+    SessionSubscribeParams, SessionSubscribeResult,
 };
 use thais_providers::{
     ChatEvent, ChatMessage, ChatRequest, Provider, ToolCall, ToolDefinition, Usage,
@@ -498,6 +499,18 @@ impl Runtime {
             .await?;
         self.sessions.lock().await.remove(session_id);
         Ok(session)
+    }
+
+    /// Release a session's mutating lease without closing the session.
+    pub async fn release_session_lease(&self, session_id: &str) -> Result<bool, RuntimeError> {
+        let session = self.storage.get_session(session_id.to_owned()).await?;
+        if session.mode != SessionMode::Build {
+            return Ok(false);
+        }
+        Ok(self
+            .storage
+            .release_lease(session.workspace, session_id.to_owned())
+            .await?)
     }
 
     /// Soft-delete a session and release its lease.
@@ -1233,6 +1246,21 @@ impl Runtime {
                 };
                 match self.archive_session(&params.session_id).await {
                     Ok(session) => RequestOutcome::ok(id, &SessionArchiveResult { session }),
+                    Err(error) => RequestOutcome::error(id, error.to_error_object()),
+                }
+            }
+            method::SESSION_RELEASE_LEASE => {
+                let params: SessionReleaseLeaseParams = match request.params_as() {
+                    Ok(params) => params,
+                    Err(error) => {
+                        return RequestOutcome::error(
+                            id,
+                            ProtocolError::InvalidParams(error.to_string()).to_error_object(),
+                        );
+                    }
+                };
+                match self.release_session_lease(&params.session_id).await {
+                    Ok(released) => RequestOutcome::ok(id, &SessionReleaseLeaseResult { released }),
                     Err(error) => RequestOutcome::error(id, error.to_error_object()),
                 }
             }

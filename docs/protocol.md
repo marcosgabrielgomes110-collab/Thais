@@ -52,6 +52,7 @@ the result so the client can decide how to proceed.
 | `session.rename` | `session_id`, `name` | `session` |
 | `session.archive` | `session_id` | `session` |
 | `session.delete` | `session_id` | `deleted` (soft delete) |
+| `session.release_lease` | `session_id` | `released` |
 | `session.resume` | `session_id` | `session`, `checkpoint`, `pending_approvals` |
 | `session.set_model` | `session_id`, `role`, `model` | `session` |
 | `models.list` | none | `models` |
@@ -86,7 +87,8 @@ Event Log is retained. `session.archive` keeps it visible when
 - `session.create` and `resume` acquire the workspace mutating lease in build
   mode. The lease is one-per-workspace across processes, expires after five
   minutes without renewal, and can be stolen only with `steal_lease: true`.
-  Plan sessions never take it.
+  Plan sessions never take it. A client can release it explicitly with
+  `session.release_lease`; the TUI does this on exit and when switching sessions.
 - Session checkpoints are written under the data directory at
   `sessions/<session_id>/checkpoint.md` with a machine-readable block,
   including the approved plan, derived tasks, compacted summary, and the last

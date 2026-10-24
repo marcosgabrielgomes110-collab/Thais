@@ -467,3 +467,17 @@ pub struct HistorySearchResult {
     /// Matching events.
     pub matches: Vec<HistoryMatch>,
 }
+
+/// Parameters for `session.release_lease`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionReleaseLeaseParams {
+    /// Target session.
+    pub session_id: String,
+}
+
+/// Result of `session.release_lease`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionReleaseLeaseResult {
+    /// Whether a lease was released.
+    pub released: bool,
+}

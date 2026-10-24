@@ -18,9 +18,10 @@ use thais_protocol::session::{
     SessionApproveParams, SessionApproveResult, SessionArchiveParams, SessionArchiveResult,
     SessionCancelParams, SessionCancelResult, SessionCreateParams, SessionCreateResult,
     SessionDeleteParams, SessionDeleteResult, SessionGetParams, SessionGetResult,
-    SessionListParams, SessionListResult, SessionRenameParams, SessionRenameResult,
-    SessionResumeParams, SessionResumeResult, SessionSendParams, SessionSendResult,
-    SessionSetModelParams, SessionSetModelResult, SessionSubscribeParams, SessionSubscribeResult,
+    SessionListParams, SessionListResult, SessionReleaseLeaseParams, SessionReleaseLeaseResult,
+    SessionRenameParams, SessionRenameResult, SessionResumeParams, SessionResumeResult,
+    SessionSendParams, SessionSendResult, SessionSetModelParams, SessionSetModelResult,
+    SessionSubscribeParams, SessionSubscribeResult,
 };
 use thiserror::Error;
 
@@ -169,6 +170,17 @@ impl<T: Transport> Client<T> {
     ) -> Result<SessionDeleteResult, SdkError> {
         let value = self
             .request(method::SESSION_DELETE, serde_json::to_value(params)?)
+            .await?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    /// Release a session's workspace lease.
+    pub async fn session_release_lease(
+        &self,
+        params: SessionReleaseLeaseParams,
+    ) -> Result<SessionReleaseLeaseResult, SdkError> {
+        let value = self
+            .request(method::SESSION_RELEASE_LEASE, serde_json::to_value(params)?)
             .await?;
         Ok(serde_json::from_value(value)?)
     }

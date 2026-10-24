@@ -112,6 +112,11 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Inspect or release workspace leases.
+    Lease {
+        #[command(subcommand)]
+        command: LeaseCommand,
+    },
     /// Validate paths, permissions, credentials, and SQLite FTS5.
     Doctor,
     /// Manage provider credentials.
@@ -188,6 +193,25 @@ impl From<ModeChoice> for SessionMode {
             ModeChoice::Build => Self::Build,
         }
     }
+}
+
+#[derive(Debug, Subcommand)]
+enum LeaseCommand {
+    /// Show the current lease holder.
+    Status {
+        /// Workspace root. Defaults to the current directory.
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+    },
+    /// Release a lease by workspace or session id.
+    Release {
+        /// Workspace root. Defaults to the current directory.
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// Release the lease held by this session.
+        #[arg(long)]
+        session: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -276,10 +300,59 @@ async fn main() -> anyhow::Result<()> {
             limit,
             json,
         } => history(query, session, workspace, limit, json).await,
+        Command::Lease { command } => lease(command).await,
         Command::Doctor => doctor(),
         Command::Auth { command } => auth(command),
         Command::Trust { status, remove } => trust(status, remove),
     }
+}
+
+async fn lease(command: LeaseCommand) -> anyhow::Result<()> {
+    let paths = Paths::discover()?;
+    paths.ensure()?;
+    let storage = StorageHandle::open(paths.database_path())?;
+    match command {
+        LeaseCommand::Status { workspace } => {
+            let workspace = match workspace {
+                Some(workspace) => workspace,
+                None => std::env::current_dir().context("current directory")?,
+            };
+            let canonical = thais_storage::canonical_workspace(&workspace)?;
+            let canonical = canonical
+                .to_str()
+                .context("workspace path is not UTF-8")?
+                .to_owned();
+            match storage.lease_holder(canonical.clone()).await? {
+                Some(lease) => println!(
+                    "{}\t{}\texpires={}",
+                    lease.session_id, canonical, lease.expires_at
+                ),
+                None => println!("no lease for {canonical}"),
+            }
+        }
+        LeaseCommand::Release { workspace, session } => {
+            let released = if let Some(session_id) = session {
+                let session = storage.get_session(session_id.clone()).await?;
+                storage.release_lease(session.workspace, session_id).await?
+            } else {
+                let workspace = match workspace {
+                    Some(workspace) => workspace,
+                    None => std::env::current_dir().context("current directory")?,
+                };
+                let canonical = thais_storage::canonical_workspace(&workspace)?;
+                let canonical = canonical
+                    .to_str()
+                    .context("workspace path is not UTF-8")?
+                    .to_owned();
+                match storage.lease_holder(canonical.clone()).await? {
+                    Some(lease) => storage.release_lease(canonical, lease.session_id).await?,
+                    None => false,
+                }
+            };
+            println!("released: {released}");
+        }
+    }
+    Ok(())
 }
 
 async fn history(
