@@ -4,6 +4,7 @@
 
 pub mod bash;
 pub mod error;
+pub mod filesystem;
 pub mod git;
 pub mod lsp;
 pub mod mcp;
@@ -17,10 +18,11 @@ pub mod tools;
 
 pub use bash::BashTool;
 pub use error::ToolError;
+pub use filesystem::{DeleteTool, MkdirTool, MoveTool};
 pub use git::{GitCommitTool, GitDiffTool, GitLogTool, GitShowTool, GitStatusTool};
 pub use lsp::{LspConfig, LspError, LspManager, LspReport};
 pub use mcp::{McpConfig, McpError, McpManager, McpServerConfig, McpTool};
-pub use memory::{MEMORY_FILE, MemoryWriteTool};
+pub use memory::{MEMORY_FILE, MemoryReadTool, MemorySearchTool, MemoryWriteTool};
 pub use mutating::{ApplyPatchTool, EditTool, WriteTool};
 pub use path_jail::PathJail;
 pub use permission::{PermissionDecision, PermissionGate, PolicyMode};

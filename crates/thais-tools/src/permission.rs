@@ -44,30 +44,11 @@ impl PermissionGate {
         tool: &str,
         args: &Value,
         jail: &PathJail,
+        known: bool,
         mutating: bool,
         summary: &str,
     ) -> PermissionDecision {
-        const KNOWN: &[&str] = &[
-            "read",
-            "list",
-            "glob",
-            "grep",
-            "git_status",
-            "git_diff",
-            "git_log",
-            "git_show",
-            "git_commit",
-            "lsp_diagnostics",
-            "lsp_definition",
-            "lsp_references",
-            "write",
-            "edit",
-            "apply_patch",
-            "bash",
-            "memory_write",
-            "subagent",
-        ];
-        if !KNOWN.contains(&tool) && !tool.starts_with("mcp__") {
+        if !known {
             return PermissionDecision::Deny(format!("tool `{tool}` is not available"));
         }
 
@@ -144,6 +125,7 @@ mod tests {
                 "read",
                 &json!({"path": "src.rs"}),
                 &jail,
+                true,
                 false,
                 "read src.rs"
             ),
@@ -161,6 +143,7 @@ mod tests {
                 "read",
                 &json!({"path": ".env"}),
                 &jail,
+                true,
                 false,
                 "read .env"
             ),
@@ -178,6 +161,7 @@ mod tests {
                 &json!({"path": "file.txt"}),
                 &jail,
                 true,
+                true,
                 "write file.txt"
             ),
             PermissionDecision::Deny(_)
@@ -188,6 +172,7 @@ mod tests {
                 &json!({"path": "file.txt"}),
                 &jail,
                 true,
+                true,
                 "write file.txt"
             ),
             PermissionDecision::Ask(_)
@@ -197,6 +182,7 @@ mod tests {
                 "bash",
                 &json!({"command": "ls"}),
                 &jail,
+                true,
                 true,
                 "bash: ls"
             ),
@@ -216,6 +202,7 @@ mod tests {
                 "read",
                 &json!({"path": "/etc/passwd"}),
                 &jail,
+                true,
                 false,
                 "read"
             ),
@@ -226,6 +213,7 @@ mod tests {
                 "read",
                 &json!({"path": ".git/config"}),
                 &jail,
+                true,
                 false,
                 "read"
             ),
@@ -236,6 +224,7 @@ mod tests {
                 "unknown",
                 &json!({}),
                 &jail,
+                false,
                 false,
                 "unknown"
             ),

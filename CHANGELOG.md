@@ -2,6 +2,10 @@
 
 ## Unreleased — v1.0.0 Linux
 
+- Added `delete`, `move`, and `mkdir` with path-jail protection, previews, and approval.
+- Added `memory_read` and `memory_search`.
+- Replaced the permission gate's hardcoded tool list with the registry catalog.
+
 - Added CycloneDX SBOM generation with `scripts/sbom.py`.
 - Added GPG signing and release verification scripts.
 - Added `cargo-fuzz` protocol/tool-argument targets and stable proptest coverage.

@@ -647,6 +647,126 @@ async fn replay_reconstructs_the_transcript_from_the_event_log() {
 }
 
 #[tokio::test]
+async fn filesystem_and_memory_tools_round_trip() {
+    let temp = tempfile::tempdir().expect("temp");
+    std::fs::write(temp.path().join("old.txt"), "hello\n").expect("old");
+    let runtime = runtime_with_scripts(
+        &temp,
+        vec![
+            script(vec![
+                FakeStep::ToolCall {
+                    index: 0,
+                    id: "mkdir".to_owned(),
+                    name: "mkdir".to_owned(),
+                    arguments: json!({"path": "generated/nested"}).to_string(),
+                },
+                FakeStep::ToolCall {
+                    index: 1,
+                    id: "move".to_owned(),
+                    name: "move".to_owned(),
+                    arguments: json!({
+                        "from": "old.txt",
+                        "to": "generated/nested/new.txt"
+                    })
+                    .to_string(),
+                },
+                FakeStep::ToolCall {
+                    index: 2,
+                    id: "memory".to_owned(),
+                    name: "memory_write".to_owned(),
+                    arguments: json!({"rule": "Use make check before commits"}).to_string(),
+                },
+                FakeStep::ToolCall {
+                    index: 3,
+                    id: "read-memory".to_owned(),
+                    name: "memory_read".to_owned(),
+                    arguments: json!({}).to_string(),
+                },
+                FakeStep::ToolCall {
+                    index: 4,
+                    id: "search-memory".to_owned(),
+                    name: "memory_search".to_owned(),
+                    arguments: json!({"query": "make check"}).to_string(),
+                },
+                FakeStep::ToolCall {
+                    index: 5,
+                    id: "delete".to_owned(),
+                    name: "delete".to_owned(),
+                    arguments: json!({"path": "generated/nested/new.txt"}).to_string(),
+                },
+            ]),
+            script(vec![FakeStep::Text {
+                text: "done".to_owned(),
+            }]),
+        ],
+    );
+    let mut live = runtime.subscribe_live();
+    let session = runtime
+        .create_session(
+            temp.path().to_string_lossy().into_owned(),
+            SessionMode::Build,
+            None,
+        )
+        .await
+        .expect("session");
+    runtime
+        .send(&session.session_id, "organize files".to_owned(), None)
+        .await
+        .expect("send");
+
+    let mut tool_names = Vec::new();
+    let mut approvals = 0;
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let event = live.recv().await.expect("event");
+            if event.session_id != session.session_id {
+                continue;
+            }
+            match event.kind {
+                EventKind::PermissionRequested => {
+                    approvals += 1;
+                    runtime
+                        .approve(
+                            &session.session_id,
+                            event.payload["approval_id"].as_str().expect("approval"),
+                            ApprovalDecision::Allow,
+                        )
+                        .await
+                        .expect("approve");
+                }
+                EventKind::ToolResult => {
+                    if let Some(name) = event.payload["name"].as_str() {
+                        tool_names.push(name.to_owned());
+                    }
+                    assert_eq!(event.payload["is_error"], false, "{}", event.payload);
+                }
+                EventKind::TurnCompleted => break,
+                EventKind::Error => panic!("turn failed: {}", event.payload),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("turn");
+
+    assert_eq!(approvals, 4, "mkdir, move, memory_write, delete");
+    for expected in [
+        "mkdir",
+        "move",
+        "memory_write",
+        "memory_read",
+        "memory_search",
+        "delete",
+    ] {
+        assert!(tool_names.iter().any(|name| name == expected), "{expected}");
+    }
+    assert!(!temp.path().join("old.txt").exists());
+    assert!(temp.path().join("generated/nested").is_dir());
+    let memory = std::fs::read_to_string(temp.path().join("MEMORY.md")).expect("memory");
+    assert!(memory.contains("Use make check before commits"));
+}
+
+#[tokio::test]
 async fn write_requires_approval_and_reports_a_diff() {
     let temp = tempfile::tempdir().expect("temp");
     let runtime = runtime_with_scripts(

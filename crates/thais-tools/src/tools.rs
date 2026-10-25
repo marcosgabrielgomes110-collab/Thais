@@ -11,10 +11,11 @@ use serde_json::{Value, json};
 
 use crate::bash::BashTool;
 use crate::error::ToolError;
+use crate::filesystem::{DeleteTool, MkdirTool, MoveTool};
 use crate::git::{GitCommitTool, GitDiffTool, GitLogTool, GitShowTool, GitStatusTool};
 use crate::lsp::{LspConfig, LspManager, LspReport, tools as lsp_tools};
 use crate::mcp::{McpConfig, McpManager, McpTool};
-use crate::memory::MemoryWriteTool;
+use crate::memory::{MemoryReadTool, MemorySearchTool, MemoryWriteTool};
 use crate::mutating::{ApplyPatchTool, EditTool, WriteTool};
 use crate::path_jail::PathJail;
 use crate::subagent::SubagentTool;
@@ -119,6 +120,8 @@ impl ToolRegistry {
         tools.insert("git_log".to_owned(), Arc::new(GitLogTool));
         tools.insert("git_show".to_owned(), Arc::new(GitShowTool));
         tools.insert("subagent".to_owned(), Arc::new(SubagentTool));
+        tools.insert("memory_read".to_owned(), Arc::new(MemoryReadTool));
+        tools.insert("memory_search".to_owned(), Arc::new(MemorySearchTool));
         Ok(Self {
             jail,
             tools,
@@ -147,6 +150,13 @@ impl ToolRegistry {
         registry
             .tools
             .insert("memory_write".to_owned(), Arc::new(MemoryWriteTool));
+        registry
+            .tools
+            .insert("delete".to_owned(), Arc::new(DeleteTool));
+        registry.tools.insert("move".to_owned(), Arc::new(MoveTool));
+        registry
+            .tools
+            .insert("mkdir".to_owned(), Arc::new(MkdirTool));
         Ok(registry)
     }
 
@@ -230,6 +240,15 @@ impl ToolRegistry {
             .get(name)
             .ok_or_else(|| ToolError::UnknownTool(name.to_owned()))?;
         tool.execute(args, &self.jail)
+    }
+
+    /// Whether a tool is registered in this registry.
+    #[must_use]
+    pub fn is_known(&self, name: &str) -> bool {
+        if name.starts_with("mcp__") {
+            return self.mcp_tools.iter().any(|tool| tool.name == name);
+        }
+        self.tools.contains_key(name)
     }
 
     /// Whether a tool may mutate the workspace.
@@ -681,6 +700,8 @@ mod tests {
                 "glob",
                 "grep",
                 "list",
+                "memory_read",
+                "memory_search",
                 "read",
                 "subagent",
             ]

@@ -1765,6 +1765,7 @@ impl Runtime {
                     &call.name,
                     &arguments,
                     tools.jail(),
+                    tools.is_known(&call.name),
                     tools.is_mutating(&call.name),
                     &tools.summary(&call.name, &arguments),
                 );
@@ -2422,6 +2423,7 @@ impl Runtime {
                         &call.name,
                         &arguments,
                         tools.jail(),
+                        tools.is_known(&call.name),
                         tools.is_mutating(&call.name),
                         &tools.summary(&call.name, &arguments),
                     ) {

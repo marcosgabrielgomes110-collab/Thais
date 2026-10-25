@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 
 use crate::error::ToolError;
 use crate::path_jail::PathJail;
-use crate::tools::{Tool, ToolDefinition, ToolResult};
+use crate::tools::{Tool, ToolDefinition, ToolResult, cap_output};
 
 /// Project memory file name.
 pub const MEMORY_FILE: &str = "MEMORY.md";
@@ -15,6 +15,110 @@ pub const MAX_MEMORY_TOKENS: usize = 2_000;
 /// Header used when the file is first created.
 pub const MEMORY_HEADER: &str =
     "# Project memory\n\n<!-- Thais-managed approved rules. Lower priority than AGENTS.md. -->\n\n";
+
+/// Read the approved project memory file.
+pub struct MemoryReadTool;
+
+impl Tool for MemoryReadTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "memory_read".to_owned(),
+            description:
+                "Read MEMORY.md with line numbers. Use offset and limit for large memory files."
+                    .to_owned(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "offset": {"type": "integer", "minimum": 1},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 2000}
+                },
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    fn execute(&self, args: Value, jail: &PathJail) -> Result<ToolResult, ToolError> {
+        let path = jail.resolve(MEMORY_FILE)?;
+        let text = read_memory(&path)?;
+        let offset = args
+            .get("offset")
+            .and_then(Value::as_u64)
+            .unwrap_or(1)
+            .max(1) as usize;
+        let limit = args
+            .get("limit")
+            .and_then(Value::as_u64)
+            .unwrap_or(2000)
+            .clamp(1, 2000) as usize;
+        let mut output = String::new();
+        for (index, line) in text.lines().enumerate().skip(offset - 1).take(limit) {
+            output.push_str(&format!("{:>6}\t{}\n", index + 1, line));
+        }
+        if output.is_empty() {
+            output.push_str("(MEMORY.md is empty)\n");
+        }
+        Ok(ToolResult::ok(cap_output(output)))
+    }
+}
+
+/// Search MEMORY.md for a literal, case-insensitive query.
+pub struct MemorySearchTool;
+
+impl Tool for MemorySearchTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "memory_search".to_owned(),
+            description: "Search MEMORY.md and return matching lines with line numbers.".to_owned(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "minLength": 1},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 50}
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    fn execute(&self, args: Value, jail: &PathJail) -> Result<ToolResult, ToolError> {
+        let query = args
+            .get("query")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|query| !query.is_empty())
+            .ok_or_else(|| ToolError::InvalidArgs("missing `query`".to_owned()))?;
+        if query.chars().count() > 256 {
+            return Err(ToolError::InvalidArgs(
+                "query is too long; keep it under 256 characters".to_owned(),
+            ));
+        }
+        let limit = args
+            .get("limit")
+            .and_then(Value::as_u64)
+            .unwrap_or(20)
+            .clamp(1, 50) as usize;
+        let path = jail.resolve(MEMORY_FILE)?;
+        let text = read_memory(&path)?;
+        let needle = query.to_lowercase();
+        let mut matches = Vec::new();
+        for (index, line) in text.lines().enumerate() {
+            if line.to_lowercase().contains(&needle) {
+                matches.push(format!("MEMORY.md:{}: {}", index + 1, line.trim()));
+                if matches.len() >= limit {
+                    break;
+                }
+            }
+        }
+        if matches.is_empty() {
+            return Ok(ToolResult::ok("(no memory matches)"));
+        }
+        if matches.len() >= limit {
+            matches.push("[truncated]".to_owned());
+        }
+        Ok(ToolResult::ok(cap_output(matches.join("\n"))))
+    }
+}
 
 /// Tool that appends one approved rule to `MEMORY.md`.
 pub struct MemoryWriteTool;
@@ -252,6 +356,53 @@ mod tests {
         let huge = "x".repeat(9_000);
         assert!(
             tool.execute(json!({"rule": huge}), &jail(temp.path()))
+                .is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod read_tests {
+    use super::*;
+
+    fn jail(root: &Path) -> PathJail {
+        PathJail::new(root).expect("jail")
+    }
+
+    #[test]
+    fn reads_with_offsets_and_searches_case_insensitively() {
+        let temp = tempfile::tempdir().expect("temp");
+        std::fs::write(
+            temp.path().join(MEMORY_FILE),
+            "# Memory\n- Use make check\n- Keep changes small\n",
+        )
+        .expect("memory");
+        let read = MemoryReadTool
+            .execute(json!({"offset": 2, "limit": 1}), &jail(temp.path()))
+            .expect("read");
+        assert!(read.content.contains("2\t- Use make check"));
+        assert!(!read.content.contains("Keep changes small"));
+
+        let search = MemorySearchTool
+            .execute(
+                json!({"query": "MAKE CHECK", "limit": 5}),
+                &jail(temp.path()),
+            )
+            .expect("search");
+        assert!(search.content.contains("MEMORY.md:2"));
+        assert!(search.content.contains("Use make check"));
+    }
+
+    #[test]
+    fn missing_memory_is_empty_and_query_is_required() {
+        let temp = tempfile::tempdir().expect("temp");
+        let read = MemoryReadTool
+            .execute(json!({}), &jail(temp.path()))
+            .expect("read");
+        assert!(read.content.contains("empty"));
+        assert!(
+            MemorySearchTool
+                .execute(json!({"query": "  "}), &jail(temp.path()))
                 .is_err()
         );
     }
