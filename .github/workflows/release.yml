@@ -53,6 +53,7 @@ jobs:
           gpg --batch --yes --local-user "$fingerprint" --armor --detach-sign \
             --output target/distrib/SHA256SUMS.dist.asc \
             target/distrib/SHA256SUMS.dist
+          gpg --armor --export "$fingerprint" > target/release/thais-signing-key.asc
 
       - name: Upload release artifacts
         uses: actions/upload-artifact@v4
@@ -65,6 +66,7 @@ jobs:
             target/release/SHA256SUMS
             target/release/SHA256SUMS.asc
             target/release/thais-sbom.cdx.json.asc
+            target/release/thais-signing-key.asc
             target/distrib/thais-cli-x86_64-unknown-linux-gnu.tar.xz
             target/distrib/thais-sandbox-x86_64-unknown-linux-gnu.tar.xz
             target/distrib/thais-cli-installer.sh
@@ -78,7 +80,10 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           prerelease=""
-          case "$GITHUB_REF_NAME" in *-*) prerelease="--prerelease" ;; esac
+          latest="--latest"
+          case "$GITHUB_REF_NAME" in
+            *-*) prerelease="--prerelease"; latest="--latest=false" ;;
+          esac
           gh release create "$GITHUB_REF_NAME" \
             target/release/thais \
             target/release/thais-sandbox \
@@ -86,6 +91,7 @@ jobs:
             target/release/SHA256SUMS \
             target/release/SHA256SUMS.asc \
             target/release/thais-sbom.cdx.json.asc \
+            target/release/thais-signing-key.asc \
             target/distrib/thais-cli-x86_64-unknown-linux-gnu.tar.xz \
             target/distrib/thais-sandbox-x86_64-unknown-linux-gnu.tar.xz \
             target/distrib/thais-cli-installer.sh \
@@ -95,5 +101,5 @@ jobs:
             target/distrib/SHA256SUMS.dist.asc \
             --title "$GITHUB_REF_NAME" \
             --notes-file CHANGELOG.md \
-            --latest=false \
+            $latest \
             $prerelease
