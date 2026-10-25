@@ -1767,6 +1767,7 @@ impl Runtime {
                     tools.jail(),
                     tools.is_known(&call.name),
                     tools.is_mutating(&call.name),
+                    tools.approval(&call.name),
                     &tools.summary(&call.name, &arguments),
                 );
                 let decision = match decision {
@@ -2425,6 +2426,7 @@ impl Runtime {
                         tools.jail(),
                         tools.is_known(&call.name),
                         tools.is_mutating(&call.name),
+                        tools.approval(&call.name),
                         &tools.summary(&call.name, &arguments),
                     ) {
                         PermissionDecision::Allow => {

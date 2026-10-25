@@ -11,16 +11,19 @@ use serde_json::{Value, json};
 
 use crate::bash::BashTool;
 use crate::error::ToolError;
+use crate::exec::{BuildTool, TestTool};
 use crate::filesystem::{DeleteTool, MkdirTool, MoveTool};
 use crate::git::{
     GitBranchTool, GitCheckoutTool, GitCommitTool, GitDiffTool, GitLogTool, GitShowTool,
     GitStashTool, GitStatusTool,
 };
+use crate::jobs::{self as job_tools, JobManager};
 use crate::lsp::{LspConfig, LspManager, LspReport, tools as lsp_tools};
 use crate::mcp::{McpConfig, McpManager, McpTool};
 use crate::memory::{MemoryReadTool, MemorySearchTool, MemoryWriteTool};
 use crate::mutating::{ApplyPatchTool, EditTool, WriteTool};
 use crate::path_jail::PathJail;
+use crate::sandbox::Sandbox;
 use crate::secret::SecretScanTool;
 use crate::subagent::SubagentTool;
 
@@ -70,6 +73,15 @@ impl ToolResult {
     }
 }
 
+/// Whether a tool requires explicit user approval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Approval {
+    /// Execute without a prompt when policy and path checks allow it.
+    Never,
+    /// Always ask before executing.
+    Ask,
+}
+
 /// A tool exposed to the model. Tools do synchronous I/O and are executed on a
 /// blocking pool by the runtime.
 pub trait Tool: Send + Sync {
@@ -82,6 +94,15 @@ pub trait Tool: Send + Sync {
     /// Whether the tool may change the workspace.
     fn mutating(&self) -> bool {
         false
+    }
+
+    /// Whether the tool always needs approval. Mutating tools default to Ask.
+    fn approval(&self) -> Approval {
+        if self.mutating() {
+            Approval::Ask
+        } else {
+            Approval::Never
+        }
     }
 
     /// Short action summary used by approval prompts.
@@ -169,6 +190,20 @@ impl ToolRegistry {
         registry
             .tools
             .insert("git_stash".to_owned(), Arc::new(GitStashTool));
+        let jobs = Arc::new(JobManager::new(&registry.jail)?);
+        let sandbox = Sandbox::from_env();
+        for (name, tool) in job_tools::tools(jobs, sandbox.clone()) {
+            registry.tools.insert(name.to_owned(), tool);
+        }
+        let log_dir = registry.jail.resolve("target/thais-logs")?;
+        registry.tools.insert(
+            "test".to_owned(),
+            Arc::new(TestTool::new(sandbox.clone(), log_dir.clone())),
+        );
+        registry.tools.insert(
+            "build".to_owned(),
+            Arc::new(BuildTool::new(sandbox, log_dir)),
+        );
         Ok(registry)
     }
 
@@ -261,6 +296,21 @@ impl ToolRegistry {
             return self.mcp_tools.iter().any(|tool| tool.name == name);
         }
         self.tools.contains_key(name)
+    }
+
+    /// Approval policy for a tool. Unknown and mutating MCP tools ask.
+    #[must_use]
+    pub fn approval(&self, name: &str) -> Approval {
+        if name.starts_with("mcp__") {
+            return if self.is_mutating(name) {
+                Approval::Ask
+            } else {
+                Approval::Never
+            };
+        }
+        self.tools
+            .get(name)
+            .map_or(Approval::Never, |tool| tool.approval())
     }
 
     /// Whether a tool may mutate the workspace.

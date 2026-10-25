@@ -3,6 +3,7 @@
 use serde_json::Value;
 
 use crate::path_jail::PathJail;
+use crate::tools::Approval;
 
 /// Session policy mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,6 +40,7 @@ impl PermissionGate {
 
     /// Check a tool call against the active mode and policy.
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn check(
         &self,
         tool: &str,
@@ -46,18 +48,20 @@ impl PermissionGate {
         jail: &PathJail,
         known: bool,
         mutating: bool,
+        approval: Approval,
         summary: &str,
     ) -> PermissionDecision {
         if !known {
             return PermissionDecision::Deny(format!("tool `{tool}` is not available"));
         }
 
-        if mutating {
-            if self.mode == PolicyMode::Plan {
-                return PermissionDecision::Deny(
-                    "plan mode is read-only; approve the plan before changing files".to_owned(),
-                );
-            }
+        if self.mode == PolicyMode::Plan && (mutating || approval == Approval::Ask) {
+            return PermissionDecision::Deny(
+                "plan mode is read-only; approve the plan before executing or changing files"
+                    .to_owned(),
+            );
+        }
+        if approval == Approval::Ask {
             return PermissionDecision::Ask(summary.to_owned());
         }
 
@@ -127,10 +131,53 @@ mod tests {
                 &jail,
                 true,
                 false,
+                Approval::Never,
                 "read src.rs"
             ),
             PermissionDecision::Allow
         );
+    }
+
+    #[test]
+    fn non_mutating_execution_still_asks_and_plan_denies_it() {
+        let temp = tempfile::tempdir().expect("temp");
+        let jail = PathJail::new(temp.path()).expect("jail");
+        assert!(matches!(
+            PermissionGate::new(PolicyMode::Build).check(
+                "build",
+                &json!({}),
+                &jail,
+                true,
+                false,
+                Approval::Ask,
+                "build"
+            ),
+            PermissionDecision::Ask(_)
+        ));
+        assert!(matches!(
+            PermissionGate::new(PolicyMode::Plan).check(
+                "build",
+                &json!({}),
+                &jail,
+                true,
+                false,
+                Approval::Ask,
+                "build"
+            ),
+            PermissionDecision::Deny(_)
+        ));
+        assert!(matches!(
+            PermissionGate::new(PolicyMode::Plan).check(
+                "write",
+                &json!({"path": "x"}),
+                &jail,
+                true,
+                true,
+                Approval::Never,
+                "write x"
+            ),
+            PermissionDecision::Deny(_)
+        ));
     }
 
     #[test]
@@ -145,6 +192,7 @@ mod tests {
                 &jail,
                 true,
                 false,
+                Approval::Never,
                 "read .env"
             ),
             PermissionDecision::Ask(_)
@@ -162,6 +210,7 @@ mod tests {
                 &jail,
                 true,
                 true,
+                Approval::Ask,
                 "write file.txt"
             ),
             PermissionDecision::Deny(_)
@@ -173,6 +222,7 @@ mod tests {
                 &jail,
                 true,
                 true,
+                Approval::Ask,
                 "write file.txt"
             ),
             PermissionDecision::Ask(_)
@@ -184,6 +234,7 @@ mod tests {
                 &jail,
                 true,
                 true,
+                Approval::Ask,
                 "bash: ls"
             ),
             PermissionDecision::Ask(_)
@@ -204,6 +255,7 @@ mod tests {
                 &jail,
                 true,
                 false,
+                Approval::Never,
                 "read"
             ),
             PermissionDecision::Deny(_)
@@ -215,6 +267,7 @@ mod tests {
                 &jail,
                 true,
                 false,
+                Approval::Never,
                 "read"
             ),
             PermissionDecision::Deny(_)
@@ -226,6 +279,7 @@ mod tests {
                 &jail,
                 false,
                 false,
+                Approval::Never,
                 "unknown"
             ),
             PermissionDecision::Deny(_)

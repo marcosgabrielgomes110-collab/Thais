@@ -647,6 +647,85 @@ async fn replay_reconstructs_the_transcript_from_the_event_log() {
 }
 
 #[tokio::test]
+async fn build_tool_asks_without_snapshot_or_verifier() {
+    let temp = tempfile::tempdir().expect("temp");
+    std::fs::write(
+        temp.path().join("Cargo.toml"),
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("manifest");
+    std::fs::create_dir_all(temp.path().join("src")).expect("src");
+    std::fs::write(temp.path().join("src/main.rs"), "fn main() {}\n").expect("main");
+    let runtime = runtime_with_options(
+        &temp,
+        vec![
+            script(vec![FakeStep::ToolCall {
+                index: 0,
+                id: "build".to_owned(),
+                name: "build".to_owned(),
+                arguments: json!({"timeout_ms": 60_000}).to_string(),
+            }]),
+            script(vec![FakeStep::Text {
+                text: "built".to_owned(),
+            }]),
+        ],
+        Some(thais_core::Verifier::new(
+            vec!["false".to_owned()],
+            Duration::from_secs(5),
+        )),
+    );
+    let mut live = runtime.subscribe_live();
+    let session = runtime
+        .create_session(
+            temp.path().to_string_lossy().into_owned(),
+            SessionMode::Build,
+            None,
+        )
+        .await
+        .expect("session");
+    runtime
+        .send(&session.session_id, "build it".to_owned(), None)
+        .await
+        .expect("send");
+    let mut kinds = Vec::new();
+    let mut build_result = None;
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let event = live.recv().await.expect("event");
+            if event.session_id != session.session_id {
+                continue;
+            }
+            kinds.push(event.kind);
+            match event.kind {
+                EventKind::PermissionRequested => {
+                    runtime
+                        .approve(
+                            &session.session_id,
+                            event.payload["approval_id"].as_str().expect("approval"),
+                            ApprovalDecision::Allow,
+                        )
+                        .await
+                        .expect("approve");
+                }
+                EventKind::ToolResult if event.payload["name"] == "build" => {
+                    build_result = Some(event);
+                }
+                EventKind::TurnCompleted => break,
+                EventKind::Error => panic!("turn failed: {}", event.payload),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("turn");
+    assert!(!kinds.contains(&EventKind::SnapshotCreated));
+    assert!(!kinds.contains(&EventKind::VerificationStarted));
+    assert!(!kinds.contains(&EventKind::RollbackCompleted));
+    let result = build_result.expect("build result");
+    assert_eq!(result.payload["is_error"], false, "{}", result.payload);
+}
+
+#[tokio::test]
 async fn filesystem_and_memory_tools_round_trip() {
     let temp = tempfile::tempdir().expect("temp");
     std::fs::write(temp.path().join("old.txt"), "hello\n").expect("old");

@@ -162,7 +162,7 @@ impl Tool for BashTool {
     }
 }
 
-fn scrub_environment(process: &mut Command) {
+pub(crate) fn scrub_environment(process: &mut Command) {
     process.env_clear();
     #[cfg(unix)]
     let allow = [

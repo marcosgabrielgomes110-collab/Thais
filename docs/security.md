@@ -28,7 +28,7 @@ The runtime auto-detects a Linux backend:
 - The Linux sandbox uses namespaces and/or Landlock plus a seccomp denylist; it is not a complete syscall allowlist.
 - macOS and Windows are post-v1; their sandbox backends are not part of the Linux v1.0 gate.
 - Landlock is not available on kernels older than 5.13; fallback remains unsandboxed but gated.
-- Shell commands may spawn descendants; process-group cleanup is best-effort after timeout/cancel.
+- Shell commands may spawn descendants; synchronous commands use process-group cleanup after timeout/cancel. Background jobs are owned by the session registry and killed on registry drop; their logs live under `target/` and are bounded.
 - Snapshots honor `.gitignore`; ignored files and bash changes are best-effort.
 - Tool output is redacted before it reaches the model and Event Log, but a secret that matches no pattern can still pass.
 - `secret_scan` uses common credential patterns and blocks `git_commit`; it is a guardrail, not a complete entropy-based secret detector.

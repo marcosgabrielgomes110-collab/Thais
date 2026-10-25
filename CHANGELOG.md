@@ -7,6 +7,8 @@
 - Replaced the permission gate's hardcoded tool list with the registry catalog.
 - Added `git_branch`, `git_checkout`, and `git_stash`.
 - Added `secret_scan` and automatic secret scanning before `git_commit`.
+- Added background jobs (`bash_start`, `bash_logs`, `bash_stop`) with bounded logs, process-group cleanup, and approval separate from workspace mutation.
+- Added structured `test` and `build` tools with compact diagnostics and full log paths.
 
 - Added CycloneDX SBOM generation with `scripts/sbom.py`.
 - Added GPG signing and release verification scripts.
