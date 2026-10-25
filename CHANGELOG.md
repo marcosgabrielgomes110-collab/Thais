@@ -2,6 +2,8 @@
 
 ## Unreleased — v1.0.0 Linux
 
+- Upgraded the TUI: minimal foreground-only theme, Markdown formatting, mouse/keyboard scrolling, autocomplete slash commands, and session actions.
+
 - Added `delete`, `move`, and `mkdir` with path-jail protection, previews, and approval.
 - Added `memory_read` and `memory_search`.
 - Replaced the permission gate's hardcoded tool list with the registry catalog.

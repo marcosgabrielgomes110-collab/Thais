@@ -189,9 +189,12 @@ make tui cohere MODE=plan
 
 ### Teclas da TUI
 
-`Enter` envia, `Esc` cancela o turno ativo ou sai, `PageUp`/`PageDown` rolam,
-`Ctrl+S` abre o seletor de sessões e `Ctrl+C` encerra. No seletor: `Enter` retoma,
-`a` arquiva, `x` apaga e `Esc` fecha. A TUI libera o lease ao sair.
+`Enter` envia, `Esc` cancela o turno ativo ou sai, `PageUp`/`PageDown` e a roda
+do mouse rolam, `Home`/`End` vão ao topo/fim, `Ctrl+S` abre o seletor de sessões
+e `Ctrl+C` encerra. Digite `/` para comandos com autocomplete: `/help`, `/new`,
+`/sessions`, `/model`, `/history`, `/status`, `/clear`, `/cancel`, `/approve`,
+`/deny` e `/quit`. Use `Tab` para completar e `Up`/`Down` para escolher. A TUI
+usa poucas cores, sem fundos, e libera o lease ao sair.
 
 ### Headless
 

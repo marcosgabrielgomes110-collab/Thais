@@ -1,13 +1,18 @@
 #![forbid(unsafe_code)]
 
-//! Minimal M1 TUI: streaming transcript, tool cards, approval modal, cancel,
-//! scroll, and a status bar. The TUI depends only on the SDK and protocol.
+//! Minimal TUI: streaming transcript, tool cards, approval modal, slash
+//! commands, Markdown, scroll, and a status bar. The TUI depends only on the
+//! SDK and protocol.
+
+mod commands;
+mod markdown;
 
 use std::io;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -24,13 +29,16 @@ use thais_protocol::event::{EventEnvelope, EventKind};
 use thais_protocol::jsonrpc::Notification;
 use thais_protocol::method;
 use thais_protocol::session::{
-    ApprovalDecision, InitializeParams, SessionApproveParams, SessionArchiveParams,
-    SessionCancelParams, SessionCreateParams, SessionDeleteParams, SessionInfo, SessionListParams,
-    SessionMode, SessionReleaseLeaseParams, SessionResumeParams, SessionSendParams,
-    SessionSubscribeParams,
+    ApprovalDecision, HistorySearchParams, InitializeParams, SessionApproveParams,
+    SessionArchiveParams, SessionCancelParams, SessionCreateParams, SessionDeleteParams,
+    SessionInfo, SessionListParams, SessionMode, SessionReleaseLeaseParams, SessionResumeParams,
+    SessionSendParams, SessionSetModelParams, SessionSubscribeParams,
 };
 use thais_sdk::{Client, Transport};
 use tokio::sync::mpsc;
+
+use commands::SlashCommand;
+use markdown::markdown_lines;
 
 const MAX_RENDERED_LINES: usize = 4_000;
 
@@ -74,7 +82,7 @@ pub async fn run<T: Transport + 'static>(
     let mut app = AppState::new(session);
     enable_raw_mode().context("enable raw mode")?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen).context("enter alternate screen")?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture).context("enter alternate screen")?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).context("terminal")?;
 
@@ -86,7 +94,11 @@ pub async fn run<T: Transport + 'static>(
         .await;
 
     let _ = disable_raw_mode();
-    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+    let _ = execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    );
     let _ = terminal.show_cursor();
     result
 }
@@ -108,6 +120,7 @@ struct PendingApproval {
 struct AppState {
     session_id: String,
     session_name: String,
+    workspace: String,
     mode: String,
     model: String,
     transcript: String,
@@ -121,6 +134,10 @@ struct AppState {
     streaming: bool,
     auto_scroll: bool,
     scroll: u16,
+    max_scroll: u16,
+    viewport_height: u16,
+    suggestions: Vec<&'static SlashCommand>,
+    suggestion_index: usize,
     should_quit: bool,
 }
 
@@ -129,6 +146,7 @@ impl AppState {
         Self {
             session_id: session.session_id,
             session_name: session.name,
+            workspace: session.workspace,
             mode: match session.mode {
                 SessionMode::Plan => "plan".to_owned(),
                 SessionMode::Build => "build".to_owned(),
@@ -149,8 +167,65 @@ impl AppState {
             streaming: false,
             auto_scroll: true,
             scroll: 0,
+            max_scroll: 0,
+            viewport_height: 0,
+            suggestions: Vec::new(),
+            suggestion_index: 0,
             should_quit: false,
         }
+    }
+
+    fn append(&mut self, text: &str) {
+        if !self.transcript.is_empty() && !self.transcript.ends_with('\n') {
+            self.transcript.push('\n');
+        }
+        self.transcript.push_str(text);
+        if !text.ends_with('\n') {
+            self.transcript.push('\n');
+        }
+    }
+
+    fn refresh_suggestions(&mut self) {
+        self.suggestions = commands::matching(&self.input);
+        self.suggestion_index = 0;
+    }
+
+    fn accept_suggestion(&mut self) {
+        if let Some(input) = commands::complete(&self.input, self.suggestion_index) {
+            self.input = input;
+            self.refresh_suggestions();
+        }
+    }
+
+    fn scroll_by(&mut self, delta: i32) {
+        if self.max_scroll == 0 {
+            self.auto_scroll = true;
+            self.scroll = 0;
+            return;
+        }
+        if delta < 0 {
+            self.auto_scroll = false;
+            self.scroll = self.scroll.saturating_sub(delta.unsigned_abs() as u16);
+        } else {
+            let next = self.scroll.saturating_add(delta as u16);
+            if next >= self.max_scroll {
+                self.scroll = self.max_scroll;
+                self.auto_scroll = true;
+            } else {
+                self.scroll = next;
+                self.auto_scroll = false;
+            }
+        }
+    }
+
+    fn scroll_to_top(&mut self) {
+        self.auto_scroll = false;
+        self.scroll = 0;
+    }
+
+    fn scroll_page(&mut self, up: bool) {
+        let amount = i32::from(self.viewport_height.saturating_sub(2).max(5));
+        self.scroll_by(if up { -amount } else { amount });
     }
 
     fn apply_notification(&mut self, notification: Notification) {
@@ -438,26 +513,54 @@ async fn handle_key<T: Transport>(
     event: Event,
     client: &Client<T>,
 ) -> Result<()> {
-    let Event::Key(key) = event else {
-        return Ok(());
-    };
-    if key.kind != KeyEventKind::Press {
-        return Ok(());
+    match event {
+        Event::Mouse(mouse) => {
+            handle_mouse(app, mouse.kind);
+            return Ok(());
+        }
+        Event::Key(key) => {
+            if key.kind != KeyEventKind::Press {
+                return Ok(());
+            }
+            handle_key_press(app, key, client).await?;
+        }
+        _ => {}
     }
-    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-        app.should_quit = true;
-        return Ok(());
-    }
-    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
-        app.sessions = client
-            .session_list(SessionListParams {
-                include_archived: true,
-            })
-            .await?
-            .sessions;
-        app.picker = Some(0);
-        app.status = "sessions".to_owned();
-        return Ok(());
+    Ok(())
+}
+
+async fn handle_key_press<T: Transport>(
+    app: &mut AppState,
+    key: crossterm::event::KeyEvent,
+    client: &Client<T>,
+) -> Result<()> {
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        match key.code {
+            KeyCode::Char('c') => {
+                app.should_quit = true;
+                return Ok(());
+            }
+            KeyCode::Char('s') => {
+                if let Err(error) = open_session_picker(app, client).await {
+                    app.append(&format!("[error] {error}"));
+                    app.status = "error".to_owned();
+                }
+                return Ok(());
+            }
+            KeyCode::Char('l') => {
+                app.transcript.clear();
+                app.reasoning.clear();
+                app.scroll = 0;
+                app.auto_scroll = true;
+                return Ok(());
+            }
+            KeyCode::Char('u') => {
+                app.input.clear();
+                app.refresh_suggestions();
+                return Ok(());
+            }
+            _ => return Ok(()),
+        }
     }
 
     if app.picker.is_some() {
@@ -484,35 +587,202 @@ async fn handle_key<T: Transport>(
         return Ok(());
     }
 
+    if !app.suggestions.is_empty() {
+        match key.code {
+            KeyCode::Up => {
+                app.suggestion_index = app.suggestion_index.saturating_sub(1);
+                return Ok(());
+            }
+            KeyCode::Down => {
+                if app.suggestion_index + 1 < app.suggestions.len() {
+                    app.suggestion_index += 1;
+                }
+                return Ok(());
+            }
+            KeyCode::Tab => {
+                app.accept_suggestion();
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+
     match key.code {
         KeyCode::Enter => {
-            let task = app.input.trim().to_owned();
-            if task.is_empty() || app.streaming {
+            let input = app.input.trim().to_owned();
+            if input.is_empty() {
+                return Ok(());
+            }
+            if input.starts_with('/') {
+                if commands::parse(&input).is_some() {
+                    if let Err(error) = execute_command(app, client, &input).await {
+                        app.append(&format!("[error] {error}"));
+                        app.status = "error".to_owned();
+                    }
+                } else if !app.suggestions.is_empty() {
+                    app.accept_suggestion();
+                } else {
+                    app.append(&format!("unknown command: {input}\nUse /help."));
+                }
+                return Ok(());
+            }
+            if app.streaming {
                 return Ok(());
             }
             app.input.clear();
-            app.transcript.push_str(&format!("\n> {task}\n"));
+            app.suggestions.clear();
+            app.append(&format!("> {input}"));
             app.streaming = true;
             app.status = "thinking".to_owned();
             if let Err(error) = client
                 .session_send(SessionSendParams {
                     session_id: app.session_id.clone(),
-                    input: task,
+                    input,
                     turn_id: None,
                     model: None,
                 })
                 .await
             {
                 app.streaming = false;
-                app.transcript.push_str(&format!("\n[error] {error}\n"));
+                app.append(&format!("[error] {error}"));
                 app.status = "error".to_owned();
             }
         }
-        KeyCode::Char(character) => app.input.push(character),
+        KeyCode::Tab => {
+            app.accept_suggestion();
+        }
+        KeyCode::Char(character) => {
+            app.input.push(character);
+            app.refresh_suggestions();
+        }
         KeyCode::Backspace => {
             app.input.pop();
+            app.refresh_suggestions();
         }
         KeyCode::Esc => {
+            if !app.suggestions.is_empty() {
+                app.suggestions.clear();
+            } else if app.streaming {
+                client
+                    .session_cancel(SessionCancelParams {
+                        session_id: app.session_id.clone(),
+                        turn_id: None,
+                    })
+                    .await?;
+                app.status = "cancelling".to_owned();
+            } else if !app.input.is_empty() {
+                app.input.clear();
+            } else {
+                app.should_quit = true;
+            }
+        }
+        KeyCode::PageUp => app.scroll_page(true),
+        KeyCode::PageDown => app.scroll_page(false),
+        KeyCode::Home => app.scroll_to_top(),
+        KeyCode::End => {
+            app.scroll = app.max_scroll;
+            app.auto_scroll = true;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn handle_mouse(app: &mut AppState, kind: MouseEventKind) {
+    if app.picker.is_some() || app.pending.is_some() {
+        return;
+    }
+    match kind {
+        MouseEventKind::ScrollUp => app.scroll_by(-3),
+        MouseEventKind::ScrollDown => app.scroll_by(3),
+        _ => {}
+    }
+}
+
+async fn execute_command<T: Transport>(
+    app: &mut AppState,
+    client: &Client<T>,
+    input: &str,
+) -> Result<()> {
+    let Some((command, argument)) = commands::parse(input) else {
+        app.append("unknown command\nUse /help.");
+        return Ok(());
+    };
+    app.input.clear();
+    app.refresh_suggestions();
+    if command.name != "clear" && command.name != "quit" {
+        app.append(&format!("> {input}"));
+    }
+    match command.name {
+        "help" => app.append(&commands::help_text()),
+        "clear" => {
+            app.transcript.clear();
+            app.reasoning.clear();
+            app.scroll = 0;
+            app.auto_scroll = true;
+            app.status = "cleared".to_owned();
+        }
+        "quit" => app.should_quit = true,
+        "status" => app.append(&status_line(app)),
+        "sessions" => open_session_picker(app, client).await?,
+        "new" => new_session(app, client).await?,
+        "model" => {
+            if argument.is_empty() {
+                let result = client.models_list().await?;
+                let mut text = String::from("Models\n");
+                for model in result.models.iter().take(30) {
+                    text.push_str(&format!(
+                        "  {:<32} {:<12} {}k ctx\n",
+                        model.id,
+                        model.provider,
+                        model.context_window / 1_000
+                    ));
+                }
+                text.push_str("\nUse /model <id> to change the default model.");
+                app.append(&text);
+            } else {
+                let result = client
+                    .session_set_model(SessionSetModelParams {
+                        session_id: app.session_id.clone(),
+                        role: "default".to_owned(),
+                        model: argument.to_owned(),
+                    })
+                    .await?;
+                app.model = result.session.model;
+                app.status = "model changed".to_owned();
+                app.append(&format!("model: {}", app.model));
+            }
+        }
+        "history" => {
+            if argument.is_empty() {
+                app.append("usage: /history <query>");
+            } else {
+                let result = client
+                    .history_search(HistorySearchParams {
+                        query: argument.to_owned(),
+                        session_id: Some(app.session_id.clone()),
+                        workspace: None,
+                        limit: Some(10),
+                    })
+                    .await?;
+                app.append(&format!("History: {argument}"));
+                for hit in result.matches {
+                    let payload = serde_json::to_string(&hit.event.payload)
+                        .unwrap_or_default()
+                        .chars()
+                        .take(180)
+                        .collect::<String>();
+                    app.append(&format!(
+                        "  {} seq {} {}: {}",
+                        hit.session_name,
+                        hit.event.seq,
+                        hit.event.kind.as_str(),
+                        payload
+                    ));
+                }
+            }
+        }
+        "cancel" => {
             if app.streaming {
                 client
                     .session_cancel(SessionCancelParams {
@@ -522,22 +792,113 @@ async fn handle_key<T: Transport>(
                     .await?;
                 app.status = "cancelling".to_owned();
             } else {
-                app.should_quit = true;
+                app.append("no active turn");
             }
         }
-        KeyCode::PageUp => {
-            app.auto_scroll = false;
-            app.scroll = app.scroll.saturating_sub(5);
+        "approve" | "deny" => {
+            let Some(pending) = app.pending.clone() else {
+                app.append("no pending approval");
+                return Ok(());
+            };
+            client
+                .session_approve(SessionApproveParams {
+                    session_id: app.session_id.clone(),
+                    approval_id: pending.approval_id,
+                    decision: if command.name == "approve" {
+                        ApprovalDecision::Allow
+                    } else {
+                        ApprovalDecision::Deny
+                    },
+                })
+                .await?;
+            app.pending = None;
+            app.status = "resolving approval".to_owned();
         }
-        KeyCode::PageDown => {
-            app.scroll = app.scroll.saturating_add(5);
-        }
-        KeyCode::End => {
-            app.auto_scroll = true;
-        }
-        _ => {}
+        _ => app.append("command is not implemented"),
     }
     Ok(())
+}
+
+async fn open_session_picker<T: Transport>(app: &mut AppState, client: &Client<T>) -> Result<()> {
+    app.sessions = client
+        .session_list(SessionListParams {
+            include_archived: true,
+        })
+        .await?
+        .sessions;
+    app.picker = Some(0);
+    app.status = "sessions".to_owned();
+    Ok(())
+}
+
+async fn new_session<T: Transport>(app: &mut AppState, client: &Client<T>) -> Result<()> {
+    let _ = client
+        .session_release_lease(SessionReleaseLeaseParams {
+            session_id: app.session_id.clone(),
+        })
+        .await;
+    let mode = mode_from_str(&app.mode);
+    let created = client
+        .session_create(SessionCreateParams {
+            workspace: app.workspace.clone(),
+            name: None,
+            parent_id: None,
+            mode,
+            model: None,
+            steal_lease: false,
+        })
+        .await?;
+    let session = created.session;
+    app.session_id = session.session_id.clone();
+    app.session_name = session.name;
+    app.workspace = session.workspace;
+    app.mode = session.mode.as_str().to_owned();
+    app.model = session.model;
+    app.usage = UsageView {
+        input_tokens: session.input_tokens,
+        output_tokens: session.output_tokens,
+        cost_usd: session.cost_usd,
+    };
+    app.transcript.clear();
+    app.reasoning.clear();
+    app.pending = None;
+    app.streaming = false;
+    app.scroll = 0;
+    app.auto_scroll = true;
+    app.suggestions.clear();
+    client
+        .session_subscribe(SessionSubscribeParams {
+            session_id: app.session_id.clone(),
+            from_seq: Some(0),
+        })
+        .await?;
+    app.status = "new session".to_owned();
+    Ok(())
+}
+
+fn mode_from_str(mode: &str) -> SessionMode {
+    if mode == "plan" {
+        SessionMode::Plan
+    } else {
+        SessionMode::Build
+    }
+}
+
+fn status_line(app: &AppState) -> String {
+    format!(
+        "{} {}\nmode: {}\nmodel: {}\nworkspace: {}\ntokens: {} in / {} out\ncost: ${:.4}\nscroll: {}/{}\nstatus: {}",
+        short_id(&app.session_id),
+        app.session_name,
+        app.mode,
+        app.model,
+        app.workspace,
+        app.usage.input_tokens,
+        app.usage.output_tokens,
+        app.usage.cost_usd,
+        app.scroll,
+        app.max_scroll,
+        app.status
+    )
 }
 
 async fn handle_picker_key<T: Transport>(
@@ -579,6 +940,7 @@ async fn handle_picker_key<T: Transport>(
                 .await?;
             app.session_id = resumed.session.session_id.clone();
             app.session_name = resumed.session.name.clone();
+            app.workspace = resumed.session.workspace.clone();
             app.mode = resumed.session.mode.as_str().to_owned();
             app.model = resumed.session.model.clone();
             app.transcript.clear();
@@ -592,6 +954,7 @@ async fn handle_picker_key<T: Transport>(
             app.streaming = false;
             app.auto_scroll = true;
             app.scroll = 0;
+            app.suggestions.clear();
             app.picker = None;
             app.status = "resumed".to_owned();
             if let Some(approval) = resumed.pending_approvals.first() {
@@ -651,7 +1014,7 @@ async fn handle_picker_key<T: Transport>(
     Ok(())
 }
 
-fn draw_ui(frame: &mut Frame<'_>, app: &AppState) {
+fn draw_ui(frame: &mut Frame<'_>, app: &mut AppState) {
     let area = frame.area();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -663,42 +1026,80 @@ fn draw_ui(frame: &mut Frame<'_>, app: &AppState) {
         .split(area);
 
     let mut lines = markdown_lines(&app.transcript);
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "Type a message, or /help for commands.",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
     if lines.len() > MAX_RENDERED_LINES {
         lines = lines.split_off(lines.len() - MAX_RENDERED_LINES);
     }
     let transcript_height = chunks[0].height.saturating_sub(2) as usize;
-    let max_scroll = lines.len().saturating_sub(transcript_height) as u16;
+    app.viewport_height = chunks[0].height;
+    app.max_scroll = lines.len().saturating_sub(transcript_height) as u16;
     let scroll = if app.auto_scroll {
-        max_scroll
+        app.max_scroll
     } else {
-        app.scroll.min(max_scroll)
+        app.scroll.min(app.max_scroll)
     };
+    app.scroll = scroll;
     let transcript = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title("Thais"))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray))
+                .title(Span::styled(
+                    " thais ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )),
+        )
         .wrap(Wrap { trim: false })
         .scroll((scroll, 0));
     frame.render_widget(transcript, chunks[0]);
 
-    let input = Paragraph::new(app.input.as_str())
-        .block(Block::default().borders(Borders::ALL).title("Message"));
+    let input_title = if app.input.is_empty() {
+        " message · /help "
+    } else {
+        " message "
+    };
+    let input = Paragraph::new(app.input.as_str()).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray))
+            .title(Span::styled(
+                input_title,
+                Style::default().fg(Color::DarkGray),
+            )),
+    );
     frame.render_widget(input, chunks[1]);
 
     let status = format!(
-        "{} {} | {} | {} | tok {}/{} ${:.4} | {}",
+        "{} · {} · {} · {} · tok {}/{} · ${:.4} · {}/{} · {}",
         short_id(&app.session_id),
-        truncate(&app.session_name, 24),
+        truncate(&app.session_name, 20),
         app.mode,
-        app.model,
+        truncate(&app.model, 24),
         app.usage.input_tokens,
         app.usage.output_tokens,
         app.usage.cost_usd,
+        app.scroll,
+        app.max_scroll,
         app.status
     );
-    let status = Paragraph::new(Line::from(Span::styled(
-        status,
-        Style::default().fg(Color::Black).bg(Color::Cyan),
-    )));
-    frame.render_widget(status, chunks[2]);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            status,
+            Style::default().fg(Color::DarkGray),
+        ))),
+        chunks[2],
+    );
+
+    if !app.suggestions.is_empty() {
+        draw_autocomplete(frame, chunks[1], app);
+    }
 
     if let Some(selected) = app.picker {
         let area = centered_rect(80, 60, area);
@@ -709,13 +1110,23 @@ fn draw_ui(frame: &mut Frame<'_>, app: &AppState) {
             .enumerate()
             .map(|(index, session)| {
                 let marker = if index == selected { ">" } else { " " };
-                Line::from(format!(
-                    "{marker} {}  {}  {}  {}  {}",
-                    short_id(&session.session_id),
-                    truncate(&session.name, 28),
-                    session.mode.as_str(),
-                    session.status.as_str(),
-                    session.model
+                let style = if index == selected {
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                Line::from(Span::styled(
+                    format!(
+                        "{marker} {}  {}  {}  {}  {}",
+                        short_id(&session.session_id),
+                        truncate(&session.name, 28),
+                        session.mode.as_str(),
+                        session.status.as_str(),
+                        session.model
+                    ),
+                    style,
                 ))
             })
             .collect::<Vec<_>>();
@@ -723,14 +1134,15 @@ fn draw_ui(frame: &mut Frame<'_>, app: &AppState) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title("Sessions  [enter] resume  [a] archive  [x] delete  [esc] close"),
+                    .border_style(Style::default().fg(Color::DarkGray))
+                    .title(" sessions · enter resume · a archive · x delete · esc close "),
             )
             .wrap(Wrap { trim: false });
         frame.render_widget(modal, area);
     }
 
     if let Some(pending) = &app.pending {
-        let area = centered_rect(75, 30, area);
+        let area = centered_rect(75, 35, area);
         frame.render_widget(Clear, area);
         let text = format!(
             "Approval required\n\n{}\n\n[y] allow    [n] deny",
@@ -742,49 +1154,66 @@ fn draw_ui(frame: &mut Frame<'_>, app: &AppState) {
             text
         };
         let modal = Paragraph::new(text)
-            .block(Block::default().borders(Borders::ALL).title("Permission"))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Yellow))
+                    .title(Span::styled(
+                        " permission ",
+                        Style::default().fg(Color::Yellow),
+                    )),
+            )
             .wrap(Wrap { trim: false });
         frame.render_widget(modal, area);
     }
 }
 
-fn markdown_lines(text: &str) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-    let mut in_code = false;
-    for line in text.split('\n') {
-        if line.trim_start().starts_with("```") {
-            in_code = !in_code;
-            lines.push(Line::from(Span::styled(
-                line.to_owned(),
-                Style::default().fg(Color::Yellow),
-            )));
-            continue;
-        }
-        if in_code {
-            lines.push(Line::from(Span::styled(
-                line.to_owned(),
-                Style::default().fg(Color::Yellow),
-            )));
-        } else if line.starts_with('#') {
-            lines.push(Line::from(Span::styled(
-                line.to_owned(),
-                Style::default().add_modifier(Modifier::BOLD),
-            )));
-        } else if line.starts_with('|') {
-            lines.push(Line::from(Span::styled(
-                line.to_owned(),
-                Style::default().fg(Color::Cyan),
-            )));
-        } else if line.starts_with("- ") || line.starts_with("* ") {
-            lines.push(Line::from(Span::raw(format!("• {}", &line[2..]))));
-        } else {
-            lines.push(Line::from(line.to_owned()));
-        }
-    }
-    if lines.is_empty() {
-        lines.push(Line::from("Type a message and press Enter."));
-    }
-    lines
+fn draw_autocomplete(frame: &mut Frame<'_>, input: Rect, app: &AppState) {
+    let visible = app.suggestions.len().min(6);
+    let height = visible as u16 + 2;
+    let width = frame.area().width.min(76);
+    let y = input.y.saturating_sub(height);
+    let area = Rect::new(input.x, y, width, height);
+    frame.render_widget(Clear, area);
+    let start = app
+        .suggestion_index
+        .saturating_sub(visible.saturating_sub(1))
+        .min(app.suggestions.len().saturating_sub(visible));
+    let lines = app
+        .suggestions
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(visible)
+        .map(|(index, command)| {
+            let invocation = if command.args.is_empty() {
+                format!("/{}", command.name)
+            } else {
+                format!("/{} {}", command.name, command.args)
+            };
+            let style = if index == app.suggestion_index {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            Line::from(Span::styled(
+                format!("{invocation:<22} {}", command.description),
+                style,
+            ))
+        })
+        .collect::<Vec<_>>();
+    let popup = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray))
+            .title(Span::styled(
+                " commands · tab complete ",
+                Style::default().fg(Color::DarkGray),
+            )),
+    );
+    frame.render_widget(popup, area);
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
@@ -915,7 +1344,9 @@ mod tests {
 
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal.draw(|frame| draw_ui(frame, &app)).expect("draw");
+        terminal
+            .draw(|frame| draw_ui(frame, &mut app))
+            .expect("draw");
         let content = terminal
             .backend()
             .buffer()
@@ -934,7 +1365,9 @@ mod tests {
         let mut app = AppState::new(session());
         app.sessions = vec![session()];
         app.picker = Some(0);
-        terminal.draw(|frame| draw_ui(frame, &app)).expect("draw");
+        terminal
+            .draw(|frame| draw_ui(frame, &mut app))
+            .expect("draw");
         let content = terminal
             .backend()
             .buffer()
@@ -942,23 +1375,91 @@ mod tests {
             .iter()
             .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
-        assert!(content.contains("Sessions"));
+        assert!(content.contains("sessions"));
         assert!(content.contains("resume"));
+    }
+
+    #[test]
+    fn slash_input_populates_and_completes_autocomplete() {
+        let mut app = AppState::new(session());
+        app.input = "/he".to_owned();
+        app.refresh_suggestions();
+        assert_eq!(app.suggestions.len(), 1);
+        app.accept_suggestion();
+        assert_eq!(app.input, "/help ");
+        assert!(app.suggestions.is_empty());
+    }
+
+    #[test]
+    fn scroll_is_clamped_and_returns_to_the_bottom() {
+        let mut app = AppState::new(session());
+        app.max_scroll = 20;
+        app.viewport_height = 12;
+        app.scroll_by(-5);
+        assert_eq!(app.scroll, 0);
+        assert!(!app.auto_scroll);
+        app.scroll_by(100);
+        assert_eq!(app.scroll, 20);
+        assert!(app.auto_scroll);
+        app.scroll_to_top();
+        assert_eq!(app.scroll, 0);
+        assert!(!app.auto_scroll);
+    }
+
+    #[test]
+    fn draw_ui_uses_no_background_colors() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut app = AppState::new(session());
+        terminal
+            .draw(|frame| draw_ui(frame, &mut app))
+            .expect("draw");
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .all(|cell| cell.bg == Color::Reset)
+        );
+    }
+
+    #[test]
+    fn draw_ui_renders_autocomplete() {
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut app = AppState::new(session());
+        app.input = "/".to_owned();
+        app.refresh_suggestions();
+        terminal
+            .draw(|frame| draw_ui(frame, &mut app))
+            .expect("draw");
+        let content = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(content.contains("/help"));
+        assert!(content.contains("commands"));
     }
 
     #[test]
     fn draw_ui_renders_the_status_bar() {
         let backend = TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend).expect("terminal");
-        let app = AppState::new(session());
-        terminal.draw(|frame| draw_ui(frame, &app)).expect("draw");
+        let mut app = AppState::new(session());
+        terminal
+            .draw(|frame| draw_ui(frame, &mut app))
+            .expect("draw");
         let buffer = terminal.backend().buffer();
         let content = buffer
             .content()
             .iter()
             .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
-        assert!(content.contains("Thais"));
+        assert!(content.contains("thais"));
         assert!(content.contains("build"));
         assert!(content.contains("command-a-plus"));
     }
