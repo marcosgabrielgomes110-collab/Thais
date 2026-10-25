@@ -3534,6 +3534,7 @@ dependencies = [
  "thais-storage",
  "thais-tui",
  "tokio",
+ "toml",
  "tracing",
  "tracing-subscriber",
  "uuid",

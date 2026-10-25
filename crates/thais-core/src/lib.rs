@@ -22,7 +22,9 @@ pub use context::{ContextError, ContextManager, PromptBundle, estimate_tokens};
 pub use env_badge::EnvironmentBadge;
 pub use ids::{IdGenerator, SequenceIdGenerator, UuidGenerator};
 pub use model_policy::ModelPolicy;
-pub use provider_registry::{CatalogModel, ProviderRegistry, RegistryError};
+pub use provider_registry::{
+    CatalogModel, ProviderPresetInfo, ProviderRegistry, RegistryError, preset_info,
+};
 pub use replay::{ReplayError, ReplayState, replay_session};
 pub use runtime::{RequestOutcome, Runtime, RuntimeError};
 pub use server::{ServerError, serve, serve_stdio};

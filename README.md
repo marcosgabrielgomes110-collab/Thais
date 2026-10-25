@@ -193,7 +193,7 @@ make tui cohere MODE=plan
 do mouse rolam, `Home`/`End` vão ao topo/fim, `Ctrl+S` abre o seletor de sessões
 e `Ctrl+C` encerra. Digite `/` para comandos com autocomplete: `/help`, `/new`,
 `/sessions`, `/model`, `/history`, `/status`, `/clear`, `/cancel`, `/approve`,
-`/deny` e `/quit`. Use `Tab` para completar e `Up`/`Down` para escolher. A TUI
+`/deny`, `/connect` e `/quit`. Use `Tab` para completar e `Up`/`Down` para escolher. `/connect <provider> [model]` pede a API key sem exibi-la e reinicia a TUI com os novos modelos. A TUI
 usa poucas cores, sem fundos, e libera o lease ao sair.
 
 ### Headless

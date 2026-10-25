@@ -3,6 +3,8 @@
 ## Unreleased — v1.0.0 Linux
 
 - Upgraded the TUI: minimal foreground-only theme, Markdown formatting, mouse/keyboard scrolling, autocomplete slash commands, and session actions.
+- Added `/connect` to configure a provider and API key from the TUI, then restart with the new models.
+- Changed `make install` to default to `/usr/local/bin`, use `sudo` when needed, and create documentation directories.
 
 - Added `delete`, `move`, and `mkdir` with path-jail protection, previews, and approval.
 - Added `memory_read` and `memory_search`.

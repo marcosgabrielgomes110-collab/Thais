@@ -29,6 +29,11 @@ pub const COMMANDS: &[SlashCommand] = &[
         description: "create a new session in this workspace",
     },
     SlashCommand {
+        name: "connect",
+        args: "<provider> [model]",
+        description: "add a provider and API key, then restart",
+    },
+    SlashCommand {
         name: "sessions",
         args: "",
         description: "list and resume sessions",
@@ -107,6 +112,31 @@ pub fn parse(input: &str) -> Option<(&'static SlashCommand, &str)> {
     Some((command, argument))
 }
 
+/// Provider presets shown by `/connect`.
+pub const PROVIDERS: &[(&str, &str)] = &[
+    ("openai", "gpt-4.1"),
+    ("anthropic", "claude-sonnet-4-5"),
+    ("openrouter", "openai/gpt-4.1"),
+    ("deepseek", "deepseek-chat"),
+    ("cohere", "command-a-plus-05-2026"),
+    ("qwen", "qwen-plus"),
+    ("zai", "glm-4.5"),
+    ("ollama", "llama3.2"),
+    ("vllm", "local-model"),
+    ("litellm", "gpt-4o-mini"),
+];
+
+/// Help shown by `/connect` without arguments.
+#[must_use]
+pub fn connect_help() -> String {
+    let mut output = String::from("Connect a provider\n");
+    for (provider, model) in PROVIDERS {
+        output.push_str(&format!("  /connect {provider} {model}\n"));
+    }
+    output.push_str("\nThe API key is requested separately and is never shown in the transcript.");
+    output
+}
+
 /// Full help text.
 #[must_use]
 pub fn help_text() -> String {
@@ -135,6 +165,8 @@ mod tests {
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].name, "help");
         assert_eq!(complete("/he", 0).as_deref(), Some("/help "));
+        assert_eq!(matching("/con")[0].name, "connect");
+        assert!(connect_help().contains("/connect openai"));
         assert!(matching("/model x").is_empty());
         assert!(matching("hello").is_empty());
         assert_eq!(matching("/").len(), COMMANDS.len());

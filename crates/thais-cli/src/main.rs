@@ -8,7 +8,9 @@ use std::sync::Arc;
 
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand, ValueEnum};
-use thais_core::{ContextManager, ProviderRegistry, Runtime, SystemClock, UuidGenerator, Verifier};
+use thais_core::{
+    ContextManager, ProviderRegistry, Runtime, SystemClock, UuidGenerator, Verifier, preset_info,
+};
 use thais_protocol::event::{EventEnvelope, EventKind};
 use thais_protocol::jsonrpc::{Message, Notification};
 use thais_protocol::method;
@@ -17,7 +19,7 @@ use thais_providers::{
     COHERE_DEFAULT_MODEL, FakeProvider, FakeScript, FakeStep, OpenAiCompatibleProvider, Provider,
 };
 use thais_sdk::channel;
-use thais_storage::{CredentialStore, Paths, Storage, StorageHandle, trust_key};
+use thais_storage::{CredentialStore, Paths, Storage, StorageHandle, trust_key, write_private};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -143,6 +145,23 @@ enum Command {
     },
     /// Validate paths, permissions, credentials, and SQLite FTS5.
     Doctor,
+    /// Connect a provider, store its key, and update providers.toml.
+    Connect {
+        /// Provider identifier (openai, anthropic, deepseek, ...).
+        provider: String,
+        /// Model identifier. Defaults to the provider preset.
+        #[arg(long)]
+        model: Option<String>,
+        /// Account label.
+        #[arg(long, default_value = "default")]
+        account: String,
+        /// Override the preset base URL.
+        #[arg(long)]
+        base_url: Option<String>,
+        /// Override the preset adapter type.
+        #[arg(long)]
+        kind: Option<String>,
+    },
     /// Manage provider credentials.
     Auth {
         #[command(subcommand)]
@@ -333,6 +352,13 @@ async fn main() -> anyhow::Result<()> {
         Command::Events { session, follow } => events(session, follow).await,
         Command::Lease { command } => lease(command).await,
         Command::Doctor => doctor(),
+        Command::Connect {
+            provider,
+            model,
+            account,
+            base_url,
+            kind,
+        } => connect(provider, model, account, base_url, kind),
         Command::Auth { command } => auth(command),
         Command::Trust { status, remove } => trust(status, remove),
     }
@@ -689,46 +715,29 @@ async fn tui(
             .to_string_lossy()
             .into_owned(),
     };
-    let runtime = build_runtime(None, provider, model.clone())?;
-    let (client_transport, mut server) = channel::pair();
-    let request_sender = server.sender();
-    let event_sender = server.sender();
-    let request_runtime = Arc::clone(&runtime);
+    loop {
+        let runtime = build_runtime(None, provider, model.clone())?;
+        let (client_transport, mut server) = channel::pair();
+        let request_sender = server.sender();
+        let event_sender = server.sender();
+        let request_runtime = Arc::clone(&runtime);
 
-    tokio::spawn(async move {
-        while let Some(request) = server.recv().await {
-            let outcome = request_runtime.handle_request(request).await;
-            if request_sender
-                .send(Message::Response(outcome.response))
-                .await
-                .is_err()
-            {
-                break;
-            }
-            for event in outcome.replay {
-                let notification =
-                    Notification::new(method::SESSION_EVENT, serde_json::json!({"event": event}));
+        tokio::spawn(async move {
+            while let Some(request) = server.recv().await {
+                let outcome = request_runtime.handle_request(request).await;
                 if request_sender
-                    .send(Message::Notification(notification))
+                    .send(Message::Response(outcome.response))
                     .await
                     .is_err()
                 {
                     break;
                 }
-            }
-        }
-    });
-
-    let mut live = runtime.subscribe_live();
-    tokio::spawn(async move {
-        loop {
-            match live.recv().await {
-                Ok(event) => {
+                for event in outcome.replay {
                     let notification = Notification::new(
                         method::SESSION_EVENT,
                         serde_json::json!({"event": event}),
                     );
-                    if event_sender
+                    if request_sender
                         .send(Message::Notification(notification))
                         .await
                         .is_err()
@@ -736,14 +745,38 @@ async fn tui(
                         break;
                     }
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(_) => break,
             }
-        }
-    });
+        });
 
-    let client = thais_sdk::Client::new(client_transport);
-    thais_tui::run(client, workspace, model, mode.into()).await?;
+        let mut live = runtime.subscribe_live();
+        tokio::spawn(async move {
+            loop {
+                match live.recv().await {
+                    Ok(event) => {
+                        let notification = Notification::new(
+                            method::SESSION_EVENT,
+                            serde_json::json!({"event": event}),
+                        );
+                        if event_sender
+                            .send(Message::Notification(notification))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let client = thais_sdk::Client::new(client_transport);
+        let outcome = thais_tui::run(client, workspace.clone(), model.clone(), mode.into()).await?;
+        if outcome != thais_tui::TuiOutcome::Restart {
+            break;
+        }
+    }
     Ok(())
 }
 
@@ -1010,6 +1043,94 @@ fn check_private_dir(label: &str, path: &Path) -> bool {
             false
         }
     }
+}
+
+fn connect(
+    provider: String,
+    model: Option<String>,
+    account: String,
+    base_url: Option<String>,
+    kind: Option<String>,
+) -> anyhow::Result<()> {
+    let paths = Paths::discover()?;
+    paths.ensure()?;
+    let preset =
+        preset_info(&provider).with_context(|| format!("unknown provider preset: {provider}"))?;
+    let mut secret = String::new();
+    std::io::stdin().read_to_string(&mut secret)?;
+    let secret = secret.trim();
+    if secret.is_empty() && preset.requires_key {
+        bail!("empty API key for {provider}");
+    }
+    let source = if secret.is_empty() {
+        None
+    } else {
+        Some(CredentialStore::new(paths.clone()).set(&provider, &account, secret)?)
+    };
+    let model = model.unwrap_or_else(|| preset.model.to_owned());
+    upsert_provider_config(
+        &paths,
+        &provider,
+        &model,
+        base_url.as_deref().unwrap_or(preset.base_url),
+        kind.as_deref().unwrap_or(preset.kind),
+    )?;
+    println!(
+        "connected {provider}:{account} model={model} key={}",
+        source.map_or("none", |source| source.as_str())
+    );
+    Ok(())
+}
+
+fn upsert_provider_config(
+    paths: &Paths,
+    provider: &str,
+    model: &str,
+    base_url: &str,
+    kind: &str,
+) -> anyhow::Result<()> {
+    let path = paths.config_file("providers.toml");
+    let mut root: toml::Value = match std::fs::read_to_string(&path) {
+        Ok(text) => toml::from_str(&text).context("invalid providers.toml")?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            toml::Value::Table(toml::map::Map::new())
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let table = root
+        .as_table_mut()
+        .context("providers.toml root must be a table")?;
+    let providers = table
+        .entry("providers".to_owned())
+        .or_insert_with(|| toml::Value::Array(Vec::new()))
+        .as_array_mut()
+        .context("providers.toml providers must be an array")?;
+    let entry = match providers
+        .iter_mut()
+        .find(|entry| entry.get("id").and_then(toml::Value::as_str) == Some(provider))
+    {
+        Some(entry) => entry,
+        None => {
+            providers.push(toml::Value::Table(toml::map::Map::new()));
+            providers.last_mut().expect("just pushed")
+        }
+    };
+    let entry = entry
+        .as_table_mut()
+        .context("provider entry must be a table")?;
+    entry.insert("id".to_owned(), toml::Value::String(provider.to_owned()));
+    entry.insert("type".to_owned(), toml::Value::String(kind.to_owned()));
+    entry.insert(
+        "base_url".to_owned(),
+        toml::Value::String(base_url.to_owned()),
+    );
+    entry.insert(
+        "models".to_owned(),
+        toml::Value::Array(vec![toml::Value::String(model.to_owned())]),
+    );
+    let text = toml::to_string_pretty(&root)?;
+    write_private(&path, text.as_bytes())?;
+    Ok(())
 }
 
 fn auth(command: AuthCommand) -> anyhow::Result<()> {

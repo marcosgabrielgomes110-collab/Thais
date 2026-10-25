@@ -363,3 +363,36 @@ fn events_command_prints_the_event_log() {
     let stdout = String::from_utf8(output.stdout).expect("stdout");
     assert!(stdout.contains("\"kind\":\"turn_completed\""), "{stdout}");
 }
+
+#[test]
+fn connect_writes_provider_config_without_printing_the_key() {
+    let temp = tempfile::tempdir().expect("temp");
+    let mut command = Command::new(binary());
+    with_xdg(&mut command, temp.path());
+    let mut child = command
+        .args(["connect", "openai", "--model", "gpt-test"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(b"sk-test-connect-key\n")
+        .expect("write");
+    let output = child.wait_with_output().expect("wait");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout");
+    assert!(stdout.contains("connected openai:default"));
+    assert!(!stdout.contains("sk-test-connect-key"));
+    let providers = std::fs::read_to_string(temp.path().join("config/thais/providers.toml"))
+        .expect("providers");
+    assert!(providers.contains("id = \"openai\""));
+    assert!(providers.contains("gpt-test"));
+}

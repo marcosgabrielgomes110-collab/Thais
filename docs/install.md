@@ -6,10 +6,20 @@
 git clone git@github.com:marcosgabrielgomes110-collab/Thais.git
 cd Thais
 make
+make install
+```
+
+`make install` installs to `/usr/local/bin` by default, creating the directory
+and documentation folder. It uses `sudo` only when the prefix is not writable.
+
+For a per-user install:
+
+```sh
 make install PREFIX="$HOME/.local"
 ```
 
-`make install` installs `thais` and the Linux `thais-sandbox` helper.
+`make install` installs `thais`, the `thais-sandbox` helper, `README.md`, and
+`CHANGELOG.md`.
 
 ## Docker
 

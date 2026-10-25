@@ -2,8 +2,10 @@
 SHELL := /bin/sh
 
 BIN ?= thais
-PREFIX ?= $(HOME)/.local
+PREFIX ?= /usr/local
 BINDIR ?= $(PREFIX)/bin
+DOCDIR ?= $(PREFIX)/share/doc/thais
+SUDO ?= sudo
 ARGS ?=
 TARGET ?= target/release/$(BIN)
 DIST_DIR ?= dist
@@ -79,14 +81,26 @@ fake cohere:
 	@:
 
 install: build
-	mkdir -p "$(BINDIR)"
-	install -m 0755 "$(TARGET)" "$(BINDIR)/$(BIN)"
-	@if [ -x target/release/thais-sandbox ]; then install -m 0755 target/release/thais-sandbox "$(BINDIR)/thais-sandbox"; fi
-	@echo "installed $(BINDIR)/$(BIN)"
+	@set -e; \
+	target="$(BINDIR)"; \
+	prefix="$(PREFIX)"; \
+	sudo_cmd="$(SUDO)"; \
+	if [ "$$(id -u)" -eq 0 ] || [ -w "$$target" ] || [ -w "$$prefix" ] || [ -w "$$(dirname "$$prefix")" ]; then sudo_cmd=""; fi; \
+	$$sudo_cmd mkdir -p "$$target" "$(DOCDIR)"; \
+	$$sudo_cmd install -m 0755 "$(TARGET)" "$$target/$(BIN)"; \
+	if [ -x target/release/thais-sandbox ]; then $$sudo_cmd install -m 0755 target/release/thais-sandbox "$$target/thais-sandbox"; fi; \
+	$$sudo_cmd install -m 0644 README.md CHANGELOG.md "$(DOCDIR)/"; \
+	echo "installed $$target/$(BIN)"; \
+	echo "installed $$target/thais-sandbox (when built)"
 
 uninstall:
-	rm -f "$(BINDIR)/$(BIN)" "$(BINDIR)/thais-sandbox"
-	@echo "removed $(BINDIR)/$(BIN); config, credentials, sessions, and memory were preserved"
+	@set -e; \
+	target="$(BINDIR)"; \
+	prefix="$(PREFIX)"; \
+	sudo_cmd="$(SUDO)"; \
+	if [ "$$(id -u)" -eq 0 ] || [ -w "$$target" ] || [ -w "$$prefix" ] || [ -w "$$(dirname "$$prefix")" ]; then sudo_cmd=""; fi; \
+	$$sudo_cmd rm -f "$$target/$(BIN)" "$$target/thais-sandbox" "$(DOCDIR)/README.md" "$(DOCDIR)/CHANGELOG.md"; \
+	echo "removed $$target/$(BIN); config, credentials, sessions, and memory were preserved"
 
 clean:
 	cargo clean
@@ -135,7 +149,7 @@ help:
 		'  make tui cohere            shorthand for the same' \
 		'  make tui cohere MODE=plan  start in plan mode' \
 		'  make tui PROVIDER=cohere MODEL=command-a-plus-05-2026 WORKSPACE=.' \
-		'  make install      install to $(BINDIR)' \
+		'  make install      install to $(BINDIR) (sudo when needed)' \
 		'  make uninstall    remove the installed binary' \
 		'  make clean        remove build output' \
 		'  make ci           setup + check + build' \

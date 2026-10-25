@@ -394,6 +394,51 @@ struct Preset {
     kind: &'static str,
 }
 
+/// Public metadata for a built-in provider preset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderPresetInfo {
+    /// Provider identifier.
+    pub id: &'static str,
+    /// Default base URL.
+    pub base_url: &'static str,
+    /// Default model.
+    pub model: &'static str,
+    /// Provider adapter kind.
+    pub kind: &'static str,
+    /// Whether the provider needs an API key.
+    pub requires_key: bool,
+}
+
+/// Return metadata for a built-in provider preset.
+#[must_use]
+pub fn preset_info(id: &str) -> Option<ProviderPresetInfo> {
+    let preset = preset(id)?;
+    Some(ProviderPresetInfo {
+        id: match id {
+            "openai" => "openai",
+            "anthropic" => "anthropic",
+            "openrouter" => "openrouter",
+            "deepseek" => "deepseek",
+            "cohere" => "cohere",
+            "qwen" => "qwen",
+            "zai" => "zai",
+            "ollama" => "ollama",
+            "vllm" => "vllm",
+            "litellm" => "litellm",
+            "custom-openai-compatible" => "custom-openai-compatible",
+            "fake" => "fake",
+            _ => return None,
+        },
+        base_url: preset.base_url,
+        model: preset.model,
+        kind: preset.kind,
+        requires_key: !matches!(
+            id,
+            "ollama" | "vllm" | "litellm" | "custom-openai-compatible" | "fake"
+        ),
+    })
+}
+
 fn preset(id: &str) -> Option<Preset> {
     let preset = match id {
         "openai" => Preset {

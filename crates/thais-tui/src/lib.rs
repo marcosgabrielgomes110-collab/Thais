@@ -7,7 +7,7 @@
 mod commands;
 mod markdown;
 
-use std::io;
+use std::io::{self, Write};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -42,13 +42,22 @@ use markdown::markdown_lines;
 
 const MAX_RENDERED_LINES: usize = 4_000;
 
+/// Why the TUI exited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TuiOutcome {
+    /// Normal quit.
+    Quit,
+    /// A provider was connected; rebuild the runtime and start again.
+    Restart,
+}
+
 /// Start the TUI against a connected client.
 pub async fn run<T: Transport + 'static>(
     client: Client<T>,
     workspace: String,
     model: Option<String>,
     mode: SessionMode,
-) -> Result<()> {
+) -> Result<TuiOutcome> {
     let mut notifications = client.notifications();
     client
         .initialize(InitializeParams {
@@ -111,6 +120,12 @@ struct UsageView {
 }
 
 #[derive(Clone)]
+struct ConnectState {
+    provider: String,
+    model: Option<String>,
+}
+
+#[derive(Clone)]
 struct PendingApproval {
     approval_id: String,
     action: String,
@@ -138,6 +153,8 @@ struct AppState {
     viewport_height: u16,
     suggestions: Vec<&'static SlashCommand>,
     suggestion_index: usize,
+    connect: Option<ConnectState>,
+    restart: bool,
     should_quit: bool,
 }
 
@@ -171,6 +188,8 @@ impl AppState {
             viewport_height: 0,
             suggestions: Vec::new(),
             suggestion_index: 0,
+            connect: None,
+            restart: false,
             should_quit: false,
         }
     }
@@ -468,7 +487,7 @@ async fn event_loop<T: Transport>(
     client: &Client<T>,
     app: &mut AppState,
     notifications: &mut futures_util::stream::BoxStream<'static, Notification>,
-) -> Result<()> {
+) -> Result<TuiOutcome> {
     let (key_sender, mut key_receiver) = mpsc::channel(64);
     std::thread::spawn(move || {
         loop {
@@ -505,7 +524,11 @@ async fn event_loop<T: Transport>(
             _ = tick.tick() => {}
         }
     }
-    Ok(())
+    Ok(if app.restart {
+        TuiOutcome::Restart
+    } else {
+        TuiOutcome::Quit
+    })
 }
 
 async fn handle_key<T: Transport>(
@@ -583,6 +606,23 @@ async fn handle_key_press<T: Transport>(
                 .await?;
             app.pending = None;
             app.status = "resolving approval".to_owned();
+        }
+        return Ok(());
+    }
+
+    if app.connect.is_some() {
+        match key.code {
+            KeyCode::Esc => {
+                app.connect = None;
+                app.input.clear();
+                app.status = "connect cancelled".to_owned();
+            }
+            KeyCode::Enter => perform_connect(app).await?,
+            KeyCode::Backspace => {
+                app.input.pop();
+            }
+            KeyCode::Char(character) => app.input.push(character),
+            _ => {}
         }
         return Ok(());
     }
@@ -723,6 +763,34 @@ async fn execute_command<T: Transport>(
             app.status = "cleared".to_owned();
         }
         "quit" => app.should_quit = true,
+        "connect" => {
+            let mut parts = argument.split_whitespace();
+            let provider = parts.next();
+            let model = parts.next().map(str::to_owned);
+            match provider {
+                Some(provider)
+                    if commands::PROVIDERS
+                        .iter()
+                        .any(|(candidate, _)| *candidate == provider) =>
+                {
+                    app.connect = Some(ConnectState {
+                        provider: provider.to_owned(),
+                        model,
+                    });
+                    app.input.clear();
+                    app.refresh_suggestions();
+                    app.status = format!("paste API key for {provider}");
+                    app.append(&format!(
+                        "Connecting {provider}. Paste the API key and press Enter.\nThe key is not written to the transcript."
+                    ));
+                }
+                Some(provider) => app.append(&format!(
+                    "unknown provider: {provider}\n{}",
+                    commands::connect_help()
+                )),
+                None => app.append(&commands::connect_help()),
+            }
+        }
         "status" => app.append(&status_line(app)),
         "sessions" => open_session_picker(app, client).await?,
         "new" => new_session(app, client).await?,
@@ -815,6 +883,54 @@ async fn execute_command<T: Transport>(
             app.status = "resolving approval".to_owned();
         }
         _ => app.append("command is not implemented"),
+    }
+    Ok(())
+}
+
+async fn perform_connect(app: &mut AppState) -> Result<()> {
+    let Some(connect) = app.connect.take() else {
+        return Ok(());
+    };
+    let secret = app.input.trim().to_owned();
+    app.input.clear();
+    app.status = "connecting".to_owned();
+    if secret.is_empty() {
+        app.append("empty API key; connect cancelled");
+        app.status = "connect failed".to_owned();
+        return Ok(());
+    }
+    let executable = std::env::current_exe().context("current executable")?;
+    let mut command = std::process::Command::new(executable);
+    command
+        .arg("connect")
+        .arg(&connect.provider)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    if let Some(model) = &connect.model {
+        command.arg("--model").arg(model);
+    }
+    let mut child = command.spawn().context("start thais connect")?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(secret.as_bytes())?;
+        stdin.write_all(b"\n")?;
+    }
+    let output = child.wait_with_output()?;
+    if output.status.success() {
+        app.append(&format!(
+            "Provider {} connected. Restarting the TUI...",
+            connect.provider
+        ));
+        app.restart = true;
+        app.should_quit = true;
+    } else {
+        let error = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        app.append(&format!(
+            "connect failed{}{}",
+            if error.is_empty() { "" } else { ": " },
+            error
+        ));
+        app.status = "connect failed".to_owned();
     }
     Ok(())
 }
@@ -1060,12 +1176,19 @@ fn draw_ui(frame: &mut Frame<'_>, app: &mut AppState) {
         .scroll((scroll, 0));
     frame.render_widget(transcript, chunks[0]);
 
-    let input_title = if app.input.is_empty() {
+    let input_title = if app.connect.is_some() {
+        " api key · invisible "
+    } else if app.input.is_empty() {
         " message · /help "
     } else {
         " message "
     };
-    let input = Paragraph::new(app.input.as_str()).block(
+    let displayed_input = if app.connect.is_some() {
+        "*".repeat(app.input.chars().count())
+    } else {
+        app.input.clone()
+    };
+    let input = Paragraph::new(displayed_input).block(
         Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::DarkGray))
