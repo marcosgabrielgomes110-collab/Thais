@@ -178,11 +178,16 @@ impl Tool for GitCommitTool {
             .transpose()?
             .unwrap_or_default();
 
-        let secret_findings = if paths.is_empty() {
+        let mut secret_findings = if paths.is_empty() {
             scan_changed(jail, true)?
         } else {
             scan_paths(jail, &paths)?
         };
+        secret_findings.extend(crate::secret::scan_staged(jail)?);
+        secret_findings.sort_by(|left, right| {
+            (&left.path, left.line, &left.kind).cmp(&(&right.path, right.line, &right.kind))
+        });
+        secret_findings.dedup();
         if !secret_findings.is_empty() {
             return Err(ToolError::InvalidArgs(format!(
                 "secret scan blocked commit:\n{}",

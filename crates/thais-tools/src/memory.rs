@@ -12,6 +12,8 @@ use crate::tools::{Tool, ToolDefinition, ToolResult, cap_output};
 pub const MEMORY_FILE: &str = "MEMORY.md";
 /// Hard cap for the complete memory file.
 pub const MAX_MEMORY_TOKENS: usize = 2_000;
+/// Hard cap for reading the memory file in one call.
+pub const MAX_MEMORY_BYTES: u64 = 32_768;
 /// Header used when the file is first created.
 pub const MEMORY_HEADER: &str =
     "# Project memory\n\n<!-- Thais-managed approved rules. Lower priority than AGENTS.md. -->\n\n";
@@ -211,6 +213,14 @@ fn looks_like_secret(rule: &str) -> bool {
 }
 
 fn read_memory(path: &Path) -> Result<String, ToolError> {
+    if let Ok(metadata) = std::fs::metadata(path)
+        && metadata.len() > MAX_MEMORY_BYTES
+    {
+        return Err(ToolError::InvalidArgs(format!(
+            "MEMORY.md is too large ({} bytes); maximum is {MAX_MEMORY_BYTES}",
+            metadata.len()
+        )));
+    }
     match std::fs::read_to_string(path) {
         Ok(text) => Ok(text),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
@@ -391,6 +401,21 @@ mod read_tests {
             .expect("search");
         assert!(search.content.contains("MEMORY.md:2"));
         assert!(search.content.contains("Use make check"));
+    }
+
+    #[test]
+    fn huge_memory_is_rejected() {
+        let temp = tempfile::tempdir().expect("temp");
+        std::fs::write(
+            temp.path().join(MEMORY_FILE),
+            "x".repeat((MAX_MEMORY_BYTES + 1) as usize),
+        )
+        .expect("memory");
+        assert!(
+            MemoryReadTool
+                .execute(json!({}), &jail(temp.path()))
+                .is_err()
+        );
     }
 
     #[test]
