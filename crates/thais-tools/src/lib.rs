@@ -13,6 +13,7 @@ pub mod mutating;
 pub mod path_jail;
 pub mod permission;
 pub mod sandbox;
+pub mod secret;
 pub mod subagent;
 pub mod tools;
 
@@ -27,6 +28,7 @@ pub use mutating::{ApplyPatchTool, EditTool, WriteTool};
 pub use path_jail::PathJail;
 pub use permission::{PermissionDecision, PermissionGate, PolicyMode};
 pub use sandbox::{Sandbox, SandboxBackend, SandboxMode};
+pub use secret::{SecretFinding, SecretScanTool};
 pub use subagent::SubagentTool;
 pub use tools::{Tool, ToolDefinition, ToolRegistry, ToolResult};
 

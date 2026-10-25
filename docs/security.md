@@ -31,6 +31,7 @@ The runtime auto-detects a Linux backend:
 - Shell commands may spawn descendants; process-group cleanup is best-effort after timeout/cancel.
 - Snapshots honor `.gitignore`; ignored files and bash changes are best-effort.
 - Tool output is redacted before it reaches the model and Event Log, but a secret that matches no pattern can still pass.
+- `secret_scan` uses common credential patterns and blocks `git_commit`; it is a guardrail, not a complete entropy-based secret detector.
 - Pending approvals are durable, but an interrupted in-flight turn is not replayed.
 
 ## Verification

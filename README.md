@@ -55,7 +55,7 @@ compartilham o mesmo loop. Roles e fallback ficam visíveis no log.
 | **Sessões** | criação, lista, resume, rename, archive, soft-delete, checkpoint e event stream |
 | **Workspace** | lease SQLite: uma sessão mutável por workspace, várias read-only, TTL e steal explícito |
 | **Modos** | plan read-only, build com aprovação e transição explícita plan → build |
-| **Ferramentas** | leitura, grep/glob, delete/move/mkdir, memória, escrita, edit, apply_patch, bash, git status/diff/log/show/commit |
+| **Ferramentas** | leitura, grep/glob, delete/move/mkdir, memória, escrita, edit, apply_patch, bash, git status/diff/log/show/branch/checkout/stash/commit e secret_scan |
 | **Segurança** | permission gate, path jail, preview de diff, snapshots, rollback e reparo limitado |
 | **Verificação** | comandos do usuário, diagnósticos LSP e retorno `pass` / `fail` / `unavailable` |
 | **Memória** | `MEMORY.md` com escrita aprovada, diff, cap de tokens, duplicatas e precedência abaixo de `AGENTS.md` |
@@ -252,7 +252,8 @@ thais events --follow
   verificação e rollback. Contexto isolado e profundidade 1.
 - **Filesystem:** `delete`, `move` e `mkdir` com path jail, preview e aprovação.
 - **Memória:** `memory_write`, `memory_read` e `memory_search`.
-- **Git:** `git_status`, `git_diff`, `git_log`, `git_show` e `git_commit`.
+- **Git:** `git_status`, `git_diff`, `git_log`, `git_show`, `git_branch`, `git_checkout`, `git_stash` e `git_commit`.
+- **Segredos:** `secret_scan` e bloqueio automático no `git_commit`.
   Commit é gated e nunca faz amend ou reescreve histórico.
 
 ## Segurança

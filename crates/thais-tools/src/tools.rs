@@ -12,12 +12,16 @@ use serde_json::{Value, json};
 use crate::bash::BashTool;
 use crate::error::ToolError;
 use crate::filesystem::{DeleteTool, MkdirTool, MoveTool};
-use crate::git::{GitCommitTool, GitDiffTool, GitLogTool, GitShowTool, GitStatusTool};
+use crate::git::{
+    GitBranchTool, GitCheckoutTool, GitCommitTool, GitDiffTool, GitLogTool, GitShowTool,
+    GitStashTool, GitStatusTool,
+};
 use crate::lsp::{LspConfig, LspManager, LspReport, tools as lsp_tools};
 use crate::mcp::{McpConfig, McpManager, McpTool};
 use crate::memory::{MemoryReadTool, MemorySearchTool, MemoryWriteTool};
 use crate::mutating::{ApplyPatchTool, EditTool, WriteTool};
 use crate::path_jail::PathJail;
+use crate::secret::SecretScanTool;
 use crate::subagent::SubagentTool;
 
 const MAX_READ_BYTES: u64 = 2_000_000;
@@ -116,12 +120,14 @@ impl ToolRegistry {
         tools.insert("glob".to_owned(), Arc::new(GlobTool));
         tools.insert("grep".to_owned(), Arc::new(GrepTool));
         tools.insert("git_status".to_owned(), Arc::new(GitStatusTool));
+        tools.insert("git_branch".to_owned(), Arc::new(GitBranchTool));
         tools.insert("git_diff".to_owned(), Arc::new(GitDiffTool));
         tools.insert("git_log".to_owned(), Arc::new(GitLogTool));
         tools.insert("git_show".to_owned(), Arc::new(GitShowTool));
         tools.insert("subagent".to_owned(), Arc::new(SubagentTool));
         tools.insert("memory_read".to_owned(), Arc::new(MemoryReadTool));
         tools.insert("memory_search".to_owned(), Arc::new(MemorySearchTool));
+        tools.insert("secret_scan".to_owned(), Arc::new(SecretScanTool));
         Ok(Self {
             jail,
             tools,
@@ -157,6 +163,12 @@ impl ToolRegistry {
         registry
             .tools
             .insert("mkdir".to_owned(), Arc::new(MkdirTool));
+        registry
+            .tools
+            .insert("git_checkout".to_owned(), Arc::new(GitCheckoutTool));
+        registry
+            .tools
+            .insert("git_stash".to_owned(), Arc::new(GitStashTool));
         Ok(registry)
     }
 
@@ -693,6 +705,7 @@ mod tests {
         assert_eq!(
             names,
             vec![
+                "git_branch",
                 "git_diff",
                 "git_log",
                 "git_show",
@@ -703,6 +716,7 @@ mod tests {
                 "memory_read",
                 "memory_search",
                 "read",
+                "secret_scan",
                 "subagent",
             ]
         );
