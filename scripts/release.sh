@@ -10,11 +10,20 @@ python3 "$ROOT/scripts/sbom.py" "$OUT/thais-sbom.cdx.json"
 (cd "$OUT" && sha256sum thais thais-sandbox thais-sbom.cdx.json > SHA256SUMS)
 
 if [ -n "${THAIS_SIGNING_KEY:-}" ]; then
-  gpg --batch --yes --local-user "$THAIS_SIGNING_KEY" --armor --detach-sign \
+  signing_key="$THAIS_SIGNING_KEY"
+  if printf '%s' "$signing_key" | grep -q -- 'BEGIN PGP PRIVATE KEY'; then
+    printf '%s' "$signing_key" | gpg --batch --import >/dev/null 2>&1
+    signing_key=$(gpg --list-secret-keys --with-colons | awk -F: '$1 == "fpr" { print $10; exit }')
+  fi
+  if [ -z "$signing_key" ]; then
+    echo "could not resolve a GPG signing key" >&2
+    exit 1
+  fi
+  gpg --batch --yes --local-user "$signing_key" --armor --detach-sign \
     --output "$OUT/SHA256SUMS.asc" "$OUT/SHA256SUMS"
-  gpg --batch --yes --local-user "$THAIS_SIGNING_KEY" --armor --detach-sign \
+  gpg --batch --yes --local-user "$signing_key" --armor --detach-sign \
     --output "$OUT/thais-sbom.cdx.json.asc" "$OUT/thais-sbom.cdx.json"
-  echo "signed with $THAIS_SIGNING_KEY"
+  echo "signed with $signing_key"
 elif [ "${2:-}" = "--allow-unsigned" ]; then
   echo "WARNING: unsigned artifacts; not a stable release" >&2
 else

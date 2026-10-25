@@ -7,6 +7,7 @@
 - Added `cargo-fuzz` protocol/tool-argument targets and stable proptest coverage.
 - Added a two-client WebSocket event test.
 - Added a Linux performance smoke test with thresholds.
+- Added and validated cargo-dist archives, checksums, and shell installers locally.
 - Scoped v1.0 to Linux; macOS and Windows are post-v1.
 
 ## v0.8.0-m7

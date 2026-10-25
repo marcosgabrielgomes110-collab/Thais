@@ -1,8 +1,13 @@
+[workspace]
+members = ["cargo:."]
+
 [dist]
 cargo-dist-version = "0.30.0"
-installers = ["shell"]
+installers = ["shell", "powershell"]
 targets = [
   "x86_64-unknown-linux-gnu",
   "aarch64-unknown-linux-gnu",
 ]
+ci = ["github"]
+allow-dirty = ["ci"]
 pr-run-mode = "plan"

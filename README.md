@@ -338,6 +338,7 @@ make sbom       # CycloneDX SBOM
 make fuzz-check # type-check fuzz targets
 scripts/release.sh v1.0.0 --allow-unsigned  # local release check
 scripts/verify-release.sh
+scripts/dist-local.sh v0.1.0  # cargo-dist archives, checksums, sh installers
 scripts/perf.sh  # first task and event-log latency
 ```
 

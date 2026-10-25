@@ -22,7 +22,8 @@ docker run --rm -it -v "$PWD:/work" -w /work thais run --task "hello"
 
 `dist-workspace.toml` defines cargo-dist targets for Linux with a shell
 installer. Release artifacts include checksums and an SBOM; signing is part of
-the stable release gate. See [release.md](release.md).
+the stable release gate. See [release.md](release.md). For local cargo-dist artifacts, run
+`./scripts/dist-local.sh v0.1.0`.
 
 ## First task
 

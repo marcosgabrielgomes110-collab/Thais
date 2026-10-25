@@ -65,3 +65,7 @@ unsafe_code = "forbid"
 
 [workspace.lints.clippy]
 all = "warn"
+
+[profile.dist]
+inherits = "release"
+lto = "thin"
