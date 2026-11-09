@@ -79,7 +79,7 @@ flowchart TD
         O[Thais<br/><i>main agent: state, modes, budgets</i>]
         P([Plan Approval<br/><i>state: plan → build</i>])
         C[Context Manager<br/><i>assembles the prompt</i>]
-        L["Model (LLM)<br/><i>proposes the next step</i>]
+        L["Model (LLM)<br/><i>proposes the next step</i>"]
         O <--> C
         C <--> L
         C -.->|token threshold| O
